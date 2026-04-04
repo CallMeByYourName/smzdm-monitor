@@ -1,0 +1,5 @@
+smzdm.db
+smzdm_old_optimized.db
+*.log
+__pycache__/
+.env
