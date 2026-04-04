@@ -191,8 +191,8 @@ class SmzdmScraper:
 
         # 计算发布时间
         age_hours = 0
-        time_sort = str(item.get('time_sort', '0')).strip()
-        if time_sort.isdigit():
+        time_sort = str(item.get('publish_date_lt', '0')).strip()
+        if time_sort.isdigit() and int(time_sort) > 0:
             ts = int(time_sort)
             if ts > 10000000000:
                 ts = ts / 1000
