@@ -212,7 +212,7 @@ class SmzdmScraper:
             'price': str(item.get('article_price', '未知')).strip(),
             'link': str(item.get('article_url', '')).strip(),
             'mall': str(item.get('article_mall', '未知')).strip(),
-            'pic': str(item.get('article_pic', '')).strip(),
+            'pub_time': str(item.get('article_format_date', '')).strip(),
             'comments': tongji['comments'] or comments,
             'collection': tongji['collection'],
             'worthy': tongji['worthy'] or worthy,
@@ -309,13 +309,11 @@ class SmzdmScraper:
 
     def _send_notification(self, data):
         """WXPusher 微信推送"""
-        pic_html = f"<img src='{data['pic']}' style='width:100%;max-width:400px;border-radius:8px;margin-bottom:15px;'><br>" if data['pic'] else ""
-        
         content = f"""
-        {pic_html}
         <b>【{data['mall']}】{data['title']}</b>
         <br><br>
         💰 价格：<span style='color:#e62828;font-weight:bold;'>{data['price']}</span><br>
+        🕒 发布：{data['pub_time']}<br>
         💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
         👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
         <br>
