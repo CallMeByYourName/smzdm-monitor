@@ -3,3 +3,6 @@ smzdm_old_optimized.db
 *.log
 __pycache__/
 .env
+.claude/
+.playwright-mcp/
+smzdm_old_optimized_final.py
