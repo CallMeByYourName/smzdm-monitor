@@ -168,8 +168,17 @@ class SmzdmScraper:
             if response.status_code != 200:
                 logging.warning(f"第{page}页 HTTP {response.status_code}")
                 return []
-            data = response.json().get('data', {})
-            return data.get('rows', [])
+            
+            resp_json = response.json()
+            if isinstance(resp_json, dict):
+                data = resp_json.get('data', {})
+                if isinstance(data, dict):
+                    return data.get('rows', [])
+                elif isinstance(data, list):
+                    return data
+            elif isinstance(resp_json, list):
+                return resp_json
+            return []
         except Exception as e:
             logging.error(f"第{page}页请求异常: {e}")
             return []
