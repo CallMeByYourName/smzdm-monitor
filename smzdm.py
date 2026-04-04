@@ -22,8 +22,9 @@ DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 
 CONFIG = {
     # 扫描参数
-    "max_pages": 50,                    # 每次运行最多扫描页数
-    "stop_after_consecutive_seen": 5,   # 连续 N 页全是已见商品时停止
+    "max_pages": 150,                   # 每次运行最多扫描页数 (放宽以扫描历史数据)
+    "max_history_hours": 3,             # 最多扫描过去多少小时内的数据
+    "blacklist_channels": ["文章", "资讯", "社区", "晒物"], # 黑名单频道，直接跳过
     "items_per_page": 20,
 
     # 第一阶段：互动数据筛选
@@ -108,9 +109,12 @@ class SmzdmScraper:
         logging.info("开始扫描...")
         self._clean_old_records()
 
-        consecutive_all_seen = 0
+        stop_scanning = False
 
         for page in range(1, CONFIG['max_pages'] + 1):
+            if stop_scanning:
+                break
+
             items = self._fetch_page(page)
             if not items:
                 logging.info(f"第{page}页无数据，停止扫描")
@@ -118,18 +122,20 @@ class SmzdmScraper:
 
             self.stats['total_fetched'] += len(items)
 
-            # 检查本页是否全是已见商品
-            new_count = 0
             for item in items:
                 parsed = self._parse_item(item)
                 if not parsed:
                     continue
 
+                # 时间窗口检查 (超过指定小时数则停止扫描后续)
+                if parsed.get('age_hours', 0) > CONFIG['max_history_hours']:
+                    logging.info(f"扫到 {parsed['age_hours']:.1f} 小时前的数据，达到时间上限 {CONFIG['max_history_hours']} 小时，停止扫描。")
+                    stop_scanning = True
+                    break
+
                 if self._is_duplicate(parsed['id']):
                     self.stats['total_duplicates'] += 1
                     continue
-
-                new_count += 1
 
                 # 第一阶段：互动数据筛选
                 if not self._filter_stage1(parsed):
@@ -145,15 +151,6 @@ class SmzdmScraper:
                 if self._send_notification(parsed):
                     self._save_history(parsed)
                     self.stats['total_sent'] += 1
-
-            # 智能停止：连续 N 页没有新商品
-            if new_count == 0:
-                consecutive_all_seen += 1
-                if consecutive_all_seen >= CONFIG['stop_after_consecutive_seen']:
-                    logging.info(f"连续 {consecutive_all_seen} 页无新商品，停止扫描")
-                    break
-            else:
-                consecutive_all_seen = 0
 
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
@@ -182,10 +179,25 @@ class SmzdmScraper:
         if not item or 'article_id' not in item:
             return None
 
+        # 频道黑名单过滤
+        channel = str(item.get('article_channel_name', '')).strip()
+        if channel in CONFIG.get('blacklist_channels', []):
+            return None
+
         article_id = str(item['article_id']).strip()
         title = str(item.get('article_title', '')).strip()[:200]
         if not article_id or not title:
             return None
+
+        # 计算发布时间
+        age_hours = 0
+        time_sort = str(item.get('time_sort', '0')).strip()
+        if time_sort.isdigit():
+            ts = int(time_sort)
+            if ts > 10000000000:
+                ts = ts / 1000
+            item_time = datetime.fromtimestamp(ts)
+            age_hours = (datetime.now() - item_time).total_seconds() / 3600
 
         worthy = max(0, int(item.get('article_worthy', 0)))
         unworthy = max(0, int(item.get('article_unworthy', 0)))
@@ -203,6 +215,7 @@ class SmzdmScraper:
             'collection': tongji['collection'],
             'worthy': tongji['worthy'] or worthy,
             'unworthy': tongji['unworthy'] or unworthy,
+            'age_hours': age_hours,
         }
 
     def _parse_tongji_hudong(self, tongji_str):
