@@ -27,7 +27,8 @@ jobs:
 
       # 从缓存恢复 SQLite 数据库
       - name: Restore database cache
-        uses: actions/cache@v4
+        id: cache-db
+        uses: actions/cache/restore@v4
         with:
           path: smzdm.db
           key: smzdm-db-${{ github.run_id }}
@@ -39,3 +40,11 @@ jobs:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: python smzdm.py
+
+      # 保存 SQLite 数据库到缓存 (无论成功失败都保存，以便保留进度)
+      - name: Save database cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: smzdm.db
+          key: smzdm-db-${{ github.run_id }}
