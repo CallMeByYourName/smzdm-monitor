@@ -22,16 +22,16 @@ DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 
 CONFIG = {
     # 扫描参数
-    "max_pages": 150,                   # 每次运行最多扫描页数 (放宽以扫描历史数据)
-    "max_history_hours": 3,             # 最多扫描过去多少小时内的数据
+    "max_pages": 300,                   # 每次运行最多扫描页数 (大幅加深以捕获成熟好价)
+    "max_history_hours": 6,             # 最多扫描过去多少小时内的数据 (给足发酵时间)
     "blacklist_channels": ["文章", "资讯", "社区", "晒物"], # 黑名单频道，直接跳过
     "items_per_page": 20,
 
     # 第一阶段：互动数据筛选
-    "min_comments": 5,
-    "min_collection": 5,
-    "min_worthy": 5,
-    "min_score_rate": 70,               # 好评率 %
+    "min_comments": 10,                 # 评论≥10 (严格筛选)
+    "min_collection": 10,               # 收藏≥10
+    "min_worthy": 10,                   # 值≥10
+    "min_score_rate": 80,               # 好评率 ≥ 80% (高质量要求)
 
     # 第二阶段：水军检测（基于互动数据异常分析，需同时满足多项）
     "shill_detection_enabled": True,
