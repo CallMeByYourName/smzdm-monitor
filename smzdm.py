@@ -22,9 +22,9 @@ DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 
 CONFIG = {
     # 扫描参数
-    "max_pages": 300,                   # 每次运行最多扫描页数 (大幅加深以捕获成熟好价)
-    "max_history_hours": 6,             # 最多扫描过去多少小时内的数据 (给足发酵时间)
-    "blacklist_channels": ["文章", "资讯", "社区", "晒物"], # 黑名单频道，直接跳过
+    "max_pages": 200,                   # 每次运行最多扫描页数
+    "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
+    "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 20,
 
     # 第一阶段：互动数据筛选
@@ -41,8 +41,8 @@ CONFIG = {
     "shill_min_flags": 2,                   # 至少N个可疑指标才标记为水军
 
     # 请求参数
-    "request_delay": (1, 3),            # 随机延迟范围（秒）
-    "timeout": 15,
+    "request_delay": (0.5, 1.5),        # 随机延迟范围（秒）
+    "timeout": 30,                      # 请求超时（秒），GitHub Actions 到国内 API 延迟较高
 }
 
 # ===== 日志 =====
@@ -70,7 +70,7 @@ class SmzdmScraper:
         }
 
     def _init_session(self):
-        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        retry = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry, pool_connections=20)
         self.session.mount('https://', adapter)
         self.session.headers.update({
@@ -116,6 +116,9 @@ class SmzdmScraper:
                 break
 
             items = self._fetch_page(page)
+            if items is None:
+                # 请求失败（区别于空数据），跳过继续下一页
+                continue
             if not items:
                 logging.info(f"第{page}页无数据，停止扫描")
                 break
@@ -167,7 +170,7 @@ class SmzdmScraper:
             )
             if response.status_code != 200:
                 logging.warning(f"第{page}页 HTTP {response.status_code}")
-                return []
+                return None  # 区分请求失败和空数据
             
             resp_json = response.json()
             if isinstance(resp_json, dict):
@@ -181,16 +184,17 @@ class SmzdmScraper:
             return []
         except Exception as e:
             logging.error(f"第{page}页请求异常: {e}")
-            return []
+            return None  # 请求失败，返回 None 让调用方跳过而非停止
 
     def _parse_item(self, item):
         """解析单个商品数据"""
         if not item or 'article_id' not in item:
             return None
 
-        # 频道黑名单过滤
-        channel = str(item.get('article_channel_name', '')).strip()
-        if channel in CONFIG.get('blacklist_channels', []):
+        # 频道白名单过滤（只保留好价相关内容，过滤掉原创文章等）
+        channel_type = str(item.get('article_channel_type', '')).strip()
+        whitelist = CONFIG.get('whitelist_channel_types')
+        if whitelist and channel_type not in whitelist:
             return None
 
         article_id = str(item['article_id']).strip()
