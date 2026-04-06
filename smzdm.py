@@ -126,7 +126,10 @@ class SmzdmScraper:
             self.browser_page.set_extra_http_headers({
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             })
-            logging.info("Playwright 浏览器已启动")
+            # 先访问首页让 WAF cookie 落地，后续文章页不再触发 JS 挑战
+            self.browser_page.goto('https://www.smzdm.com/', wait_until='load', timeout=20000)
+            time.sleep(2)
+            logging.info("Playwright 浏览器已启动，WAF cookie 已获取")
         except Exception as e:
             logging.error(f"Playwright 启动失败: {e}")
             self.browser = None
@@ -378,7 +381,7 @@ class SmzdmScraper:
 
         try:
             url = parsed['link']
-            self.browser_page.goto(url, wait_until='domcontentloaded', timeout=15000)
+            self.browser_page.goto(url, wait_until='load', timeout=20000)
 
             # 检查评论是否被系统折叠（低质量评论的强烈信号）
             folded = self.browser_page.evaluate(
