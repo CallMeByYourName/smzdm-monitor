@@ -226,6 +226,7 @@ class SmzdmScraper:
                     continue
 
                 candidates.append(parsed)
+                self.seen_ids.add(parsed['id'])  # 立即���记，防止跨页��复
 
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
@@ -377,8 +378,11 @@ class SmzdmScraper:
 
         try:
             url = parsed['link']
-            self.browser_page.goto(url, wait_until='domcontentloaded', timeout=20000)
-            # 等待评论区加载
+            self.browser_page.goto(url, wait_until='networkidle', timeout=30000)
+            # 滚动到评论区触发懒加载
+            self.browser_page.evaluate('document.querySelector("#comments, [id*=comment]")?.scrollIntoView()')
+            time.sleep(1)
+            # 等待评论区用户等级图片加载
             self.browser_page.wait_for_selector('img[src*="/level/"]', timeout=10000)
 
             # 提取所有评论用户等级
