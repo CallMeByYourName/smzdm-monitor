@@ -379,11 +379,22 @@ class SmzdmScraper:
         try:
             url = parsed['link']
             self.browser_page.goto(url, wait_until='networkidle', timeout=30000)
-            # 滚动到评论区触发懒加载
-            self.browser_page.evaluate('document.querySelector("#comments, [id*=comment]")?.scrollIntoView()')
-            time.sleep(1)
-            # 等待评论区用户等级图片加载
-            self.browser_page.wait_for_selector('img[src*="/level/"]', timeout=10000)
+
+            # 检查评论是否被系统折叠（低质量评论的强烈信号）
+            folded = self.browser_page.evaluate(
+                '!!document.querySelector(".comment-main-fold-desc")'
+            )
+            visible_comments = self.browser_page.evaluate(
+                'document.querySelectorAll("[class*=\\"list-item-level\\"]").length'
+            )
+
+            if folded and visible_comments == 0:
+                logging.warning(
+                    f"[评论全折叠] {parsed['title'][:40]}... | "
+                    f"API显示{comments_count}条评论但全部被SMZDM折叠，疑似低质量/水军"
+                )
+                parsed['level_info'] = '评论被折叠(可疑)'
+                return False
 
             # 提取所有评论用户等级
             levels = self.browser_page.evaluate('''() => {
