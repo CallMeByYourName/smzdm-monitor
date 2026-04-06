@@ -121,15 +121,20 @@ class SmzdmScraper:
         try:
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
-            self.browser = self._playwright.chromium.launch(headless=True)
-            self.browser_page = self.browser.new_page()
-            self.browser_page.set_extra_http_headers({
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            })
-            # 先访问首页让 WAF cookie 落地，后续文章页不再触发 JS 挑战
-            self.browser_page.goto('https://www.smzdm.com/', wait_until='load', timeout=20000)
-            time.sleep(2)
-            logging.info("Playwright 浏览器已启动，WAF cookie 已获取")
+            self.browser = self._playwright.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+            )
+            context = self.browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+            )
+            self.browser_page = context.new_page()
+            # 去掉 webdriver 自动化标记，绕过 WAF 检测
+            self.browser_page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+            logging.info("Playwright 浏览器已启动")
         except Exception as e:
             logging.error(f"Playwright 启动失败: {e}")
             self.browser = None
