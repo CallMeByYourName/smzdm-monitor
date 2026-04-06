@@ -378,7 +378,7 @@ class SmzdmScraper:
 
         try:
             url = parsed['link']
-            self.browser_page.goto(url, wait_until='networkidle', timeout=30000)
+            self.browser_page.goto(url, wait_until='domcontentloaded', timeout=15000)
 
             # 检查评论是否被系统折叠（低质量评论的强烈信号）
             folded = self.browser_page.evaluate(
@@ -493,8 +493,16 @@ class SmzdmScraper:
         composite_score = data.get('composite_score', 0)
         level_info = data.get('level_info', '')
 
+        # 评分等级标记
+        if composite_score >= 100:
+            score_tag = '🔥爆'
+        elif composite_score >= 60:
+            score_tag = '👍热'
+        else:
+            score_tag = '🆕新'
+
         content = f"""
-        <b>【{data['mall']}】{data['title']}</b>
+        <b>{score_tag}【{data['mall']}】{data['title']}</b>
         <br><br>
         💰 价格：<span style='color:#e62828;font-weight:bold;'>{data['price']}</span><br>
         🕒 发布：{data['pub_time']}<br>
