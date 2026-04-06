@@ -35,7 +35,7 @@ CONFIG = {
         "worthy": 1,                    # 值权重最低（最易刷）
     },
     "min_total_engagement": 15,         # 基础门槛：评论+收藏+值 >= 15
-    "min_composite_score": 40,          # 综合评分阈值
+    "min_composite_score": 45,          # 综合评分阈值 (略微调高防止低质推送)
     "min_score_rate": 70,               # 好评率 >= 70%
 
     # 第二阶段：用户等级水军检测（Playwright）
