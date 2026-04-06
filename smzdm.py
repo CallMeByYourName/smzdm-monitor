@@ -346,6 +346,11 @@ class SmzdmScraper:
         if composite_score < CONFIG['min_composite_score']:
             return False
 
+        # 好评率和综合评分挂到 parsed 上，供推送使用
+        total_votes = worthy + unworthy
+        parsed['score_rate'] = round(worthy / total_votes * 100) if total_votes > 0 else 100
+        parsed['composite_score'] = composite_score
+
         logging.info(
             f"[综合评分通过] {parsed['title'][:40]}... | "
             f"评分:{composite_score} 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
@@ -361,11 +366,13 @@ class SmzdmScraper:
 
         # 评论太少，样本不足，跳过检测
         if comments_count < CONFIG['level_check_min_comments']:
+            parsed['level_info'] = '样本不足'
             return True
 
         self._init_browser()
         if not self.browser_page:
             logging.warning(f"[等级检测跳过] 浏览器未就绪，放行: {parsed['title'][:40]}...")
+            parsed['level_info'] = '检测跳过'
             return True
 
         try:
@@ -387,6 +394,7 @@ class SmzdmScraper:
 
             if not levels:
                 logging.info(f"[等级检测跳过] 未获取到用户等级数据，放行: {parsed['title'][:40]}...")
+                parsed['level_info'] = '无数据'
                 return True
 
             threshold = CONFIG['level_normal_threshold']
@@ -406,6 +414,9 @@ class SmzdmScraper:
                 )
                 return False
 
+            avg_level = sum(levels) / len(levels)
+            parsed['level_info'] = f'均Lv{avg_level:.1f} ({dist_str})'
+
             logging.info(
                 f"[等级检测通过] {parsed['title'][:40]}... | "
                 f"低等级占比:{low_ratio:.0%} ({low_count}/{len(levels)}) | {dist_str}"
@@ -414,6 +425,7 @@ class SmzdmScraper:
 
         except Exception as e:
             logging.warning(f"[等级检测异常] {parsed['title'][:40]}... | {e}，放行")
+            parsed['level_info'] = '检测异常'
             return True
 
     def _check_shill(self, parsed):
@@ -462,6 +474,10 @@ class SmzdmScraper:
 
     def _send_notification(self, data):
         """WXPusher 微信推送"""
+        score_rate = data.get('score_rate', 0)
+        composite_score = data.get('composite_score', 0)
+        level_info = data.get('level_info', '')
+
         content = f"""
         <b>【{data['mall']}】{data['title']}</b>
         <br><br>
@@ -469,6 +485,8 @@ class SmzdmScraper:
         🕒 发布：{data['pub_time']}<br>
         💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
         👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
+        📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
+        🛡️ 用户等级：{level_info}<br>
         <br>
         🔗 <a href='{data['link']}'>点击查看详情</a>
         """
