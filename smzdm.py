@@ -38,13 +38,7 @@ CONFIG = {
     "min_composite_score": 45,          # 综合评分阈值 (略微调高防止低质推送)
     "min_score_rate": 70,               # 好评率 >= 70%
 
-    # 第二阶段：用户等级水军检测（Playwright）
-    "level_check_enabled": True,
-    "level_check_min_comments": 5,      # 评论少于此数时跳过等级检测（样本太少）
-    "level_normal_threshold": 6,        # Lv6及以上算正常用户
-    "level_shill_low_ratio": 0.5,       # 低等级用户占比超过50%判定水军
-
-    # 第三阶段：互动数据水军检测兜底（基于异常分析，需同时满足多项）
+    # 第二阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
     "shill_min_votes_for_check": 30,        # 总投票数少于此值时跳过水军检测
     "shill_max_worthy_unworthy_ratio": 30,  # 值/不值比超过此值则可疑指标+1
@@ -71,15 +65,12 @@ class SmzdmScraper:
         self._init_database()
         self.seen_ids = set()
         self._load_existing_ids()
-        self.browser = None
-        self.browser_page = None
 
         self.stats = {
             'total_fetched': 0,
             'total_sent': 0,
             'total_duplicates': 0,
             'total_filtered_stage1': 0,
-            'total_filtered_level': 0,
             'total_filtered_shill': 0,
         }
 
@@ -112,54 +103,6 @@ class SmzdmScraper:
         self.seen_ids = {row[0] for row in cursor.fetchall()}
         logging.info(f"已加载 {len(self.seen_ids)} 条历史记录")
 
-    # ==================== 浏览器 ====================
-
-    def _init_browser(self):
-        """懒加载 Playwright 浏览器（仅在需要等级检测时启动）"""
-        if self.browser is not None:
-            return
-        try:
-            from playwright.sync_api import sync_playwright
-            self._playwright = sync_playwright().start()
-            self.browser = self._playwright.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
-            )
-            context = self.browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080},
-            )
-            self.browser_page = context.new_page()
-            # 去掉 webdriver 自动化标记，绕过 WAF 检测
-            self.browser_page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
-            logging.info("Playwright 浏览器已启动")
-        except Exception as e:
-            logging.error(f"Playwright 启动失败: {e}")
-            self.browser = None
-            self.browser_page = None
-
-    def _close_browser(self):
-        """关闭 Playwright 浏览器"""
-        if self.browser_page:
-            try:
-                self.browser_page.close()
-            except Exception:
-                pass
-        if self.browser:
-            try:
-                self.browser.close()
-            except Exception:
-                pass
-        if hasattr(self, '_playwright') and self._playwright:
-            try:
-                self._playwright.stop()
-            except Exception:
-                pass
-        self.browser = None
-        self.browser_page = None
-
     # ==================== 扫描 ====================
 
     def run(self):
@@ -176,14 +119,9 @@ class SmzdmScraper:
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
 
-        # 第二轮：对候选商品做用户等级检测 + 互动数据水军检测
+        # 第二轮：互动数据水军检测
         for parsed in candidates:
-            # 第二阶段：用户等级水军检测
-            if CONFIG['level_check_enabled'] and not self._check_user_levels(parsed):
-                self.stats['total_filtered_level'] += 1
-                continue
-
-            # 第三阶段：互动数据水军检测兜底
+            # 第二阶段：互动数据水军检测兜底
             if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
                 self.stats['total_filtered_shill'] += 1
                 continue
@@ -366,91 +304,6 @@ class SmzdmScraper:
         )
         return True
 
-    def _check_user_levels(self, parsed):
-        """第二阶段：用户等级水军检测 - 通过 Playwright 抓取评论区用户等级
-
-        水军账号通常等级较低（<Lv6），如果评论区低等级用户占比过高则判定水军。
-        """
-        comments_count = parsed['comments']
-
-        # 评论太少，样本不足，跳过检测
-        if comments_count < CONFIG['level_check_min_comments']:
-            parsed['level_info'] = '样本不足'
-            return True
-
-        self._init_browser()
-        if not self.browser_page:
-            logging.warning(f"[等级检测跳过] 浏览器未就绪，放行: {parsed['title'][:40]}...")
-            parsed['level_info'] = '检测跳过'
-            return True
-
-        try:
-            url = parsed['link']
-            self.browser_page.goto(url, wait_until='load', timeout=20000)
-
-            # 检查评论是否被系统折叠（低质量评论的强烈信号）
-            folded = self.browser_page.evaluate(
-                '!!document.querySelector(".comment-main-fold-desc")'
-            )
-            visible_comments = self.browser_page.evaluate(
-                'document.querySelectorAll("[class*=\\"list-item-level\\"]").length'
-            )
-
-            if folded and visible_comments == 0:
-                logging.warning(
-                    f"[评论全折叠] {parsed['title'][:40]}... | "
-                    f"API显示{comments_count}条评论但全部被SMZDM折叠，疑似低质量/水军"
-                )
-                parsed['level_info'] = '评论被折叠(可疑)'
-                return False
-
-            # 提取所有评论用户等级
-            levels = self.browser_page.evaluate('''() => {
-                const imgs = document.querySelectorAll('img[src*="/level/"]');
-                const levels = [];
-                imgs.forEach(img => {
-                    const m = img.src.match(/\\/level\\/(\\d+)\\.png/);
-                    if (m) levels.push(parseInt(m[1]));
-                });
-                return levels;
-            }''')
-
-            if not levels:
-                logging.info(f"[等级检测跳过] 未获取到用户等级数据，放行: {parsed['title'][:40]}...")
-                parsed['level_info'] = '无数据'
-                return True
-
-            threshold = CONFIG['level_normal_threshold']
-            low_count = sum(1 for lv in levels if lv < threshold)
-            low_ratio = low_count / len(levels)
-
-            # 统计等级分布
-            dist = {}
-            for lv in levels:
-                dist[lv] = dist.get(lv, 0) + 1
-            dist_str = ' '.join(f'Lv{k}:{v}' for k, v in sorted(dist.items()))
-
-            if low_ratio > CONFIG['level_shill_low_ratio']:
-                logging.warning(
-                    f"[等级水军] {parsed['title'][:40]}... | "
-                    f"低等级占比:{low_ratio:.0%} ({low_count}/{len(levels)}) | {dist_str}"
-                )
-                return False
-
-            avg_level = sum(levels) / len(levels)
-            parsed['level_info'] = f'均Lv{avg_level:.1f} ({dist_str})'
-
-            logging.info(
-                f"[等级检测通过] {parsed['title'][:40]}... | "
-                f"低等级占比:{low_ratio:.0%} ({low_count}/{len(levels)}) | {dist_str}"
-            )
-            return True
-
-        except Exception as e:
-            logging.warning(f"[等级检测异常] {parsed['title'][:40]}... | {e}，放行")
-            parsed['level_info'] = '检测异常'
-            return True
-
     def _check_shill(self, parsed):
         """第三阶段：互动数据水军检测兜底
 
@@ -499,7 +352,6 @@ class SmzdmScraper:
         """WXPusher 微信推送"""
         score_rate = data.get('score_rate', 0)
         composite_score = data.get('composite_score', 0)
-        level_info = data.get('level_info', '')
 
         # 评分等级标记
         if composite_score >= 100:
@@ -517,7 +369,6 @@ class SmzdmScraper:
         💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
         👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
         📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
-        🛡️ 用户等级：{level_info}<br>
         <br>
         🔗 <a href='{data['link']}'>点击查看详情</a>
         """
@@ -580,13 +431,11 @@ class SmzdmScraper:
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
-        logging.info(f"  等级水军过滤: {self.stats['total_filtered_level']}")
         logging.info(f"  数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)
 
     def _cleanup(self):
-        self._close_browser()
         if hasattr(self, 'conn'):
             self.conn.close()
         if hasattr(self, 'session'):
