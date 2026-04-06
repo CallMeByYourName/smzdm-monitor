@@ -9,6 +9,7 @@ import requests
 import time
 import random
 import logging
+import re
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -27,13 +28,23 @@ CONFIG = {
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 20,
 
-    # 第一阶段：互动数据筛选
-    "min_comments": 10,                 # 评论≥10 (严格筛选)
-    "min_collection": 10,               # 收藏≥10
-    "min_worthy": 10,                   # 值≥10
-    "min_score_rate": 80,               # 好评率 ≥ 80% (高质量要求)
+    # 第一阶段：综合评分筛选
+    "score_weights": {
+        "comments": 3,                  # 评论权重最高（最难刷）
+        "collection": 2,                # 收藏权重中等
+        "worthy": 1,                    # 值权重最低（最易刷）
+    },
+    "min_total_engagement": 15,         # 基础门槛：评论+收藏+值 >= 15
+    "min_composite_score": 40,          # 综合评分阈值
+    "min_score_rate": 70,               # 好评率 >= 70%
 
-    # 第二阶段：水军检测（基于互动数据异常分析，需同时满足多项）
+    # 第二阶段：用户等级水军检测（Playwright）
+    "level_check_enabled": True,
+    "level_check_min_comments": 5,      # 评论少于此数时跳过等级检测（样本太少）
+    "level_normal_threshold": 6,        # Lv6及以上算正常用户
+    "level_shill_low_ratio": 0.5,       # 低等级用户占比超过50%判定水军
+
+    # 第三阶段：互动数据水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
     "shill_min_votes_for_check": 30,        # 总投票数少于此值时跳过水军检测
     "shill_max_worthy_unworthy_ratio": 30,  # 值/不值比超过此值则可疑指标+1
@@ -60,12 +71,15 @@ class SmzdmScraper:
         self._init_database()
         self.seen_ids = set()
         self._load_existing_ids()
+        self.browser = None
+        self.browser_page = None
 
         self.stats = {
             'total_fetched': 0,
             'total_sent': 0,
             'total_duplicates': 0,
             'total_filtered_stage1': 0,
+            'total_filtered_level': 0,
             'total_filtered_shill': 0,
         }
 
@@ -98,10 +112,50 @@ class SmzdmScraper:
         self.seen_ids = {row[0] for row in cursor.fetchall()}
         logging.info(f"已加载 {len(self.seen_ids)} 条历史记录")
 
+    # ==================== 浏览器 ====================
+
+    def _init_browser(self):
+        """懒加载 Playwright 浏览器（仅在需要等级检测时启动）"""
+        if self.browser is not None:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+            self._playwright = sync_playwright().start()
+            self.browser = self._playwright.chromium.launch(headless=True)
+            self.browser_page = self.browser.new_page()
+            self.browser_page.set_extra_http_headers({
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            })
+            logging.info("Playwright 浏览器已启动")
+        except Exception as e:
+            logging.error(f"Playwright 启动失败: {e}")
+            self.browser = None
+            self.browser_page = None
+
+    def _close_browser(self):
+        """关闭 Playwright 浏览器"""
+        if self.browser_page:
+            try:
+                self.browser_page.close()
+            except Exception:
+                pass
+        if self.browser:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+        if hasattr(self, '_playwright') and self._playwright:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+        self.browser = None
+        self.browser_page = None
+
     # ==================== 扫描 ====================
 
     def run(self):
-        """单次执行入口：扫描 -> 筛选 -> 推送 -> 退出"""
+        """单次执行入口：扫描 -> 三层筛选 -> 推送 -> 退出"""
         if not APP_TOKEN or not UID:
             logging.error("缺少 WXPUSHER_APP_TOKEN 或 WXPUSHER_UID 环境变量")
             sys.exit(1)
@@ -109,6 +163,34 @@ class SmzdmScraper:
         logging.info("开始扫描...")
         self._clean_old_records()
 
+        # 第一轮：API 扫描 + 综合评分筛选，收集候选商品
+        candidates = self._scan_and_filter_stage1()
+
+        logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
+
+        # 第二轮：对候选商品做用户等级检测 + 互动数据水军检测
+        for parsed in candidates:
+            # 第二阶段：用户等级水军检测
+            if CONFIG['level_check_enabled'] and not self._check_user_levels(parsed):
+                self.stats['total_filtered_level'] += 1
+                continue
+
+            # 第三阶段：互动数据水军检测兜底
+            if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
+                self.stats['total_filtered_shill'] += 1
+                continue
+
+            # 推送
+            if self._send_notification(parsed):
+                self._save_history(parsed)
+                self.stats['total_sent'] += 1
+
+        self._print_statistics()
+        self._cleanup()
+
+    def _scan_and_filter_stage1(self):
+        """扫描 API 并通过综合评分筛选候选商品"""
+        candidates = []
         stop_scanning = False
 
         for page in range(1, CONFIG['max_pages'] + 1):
@@ -117,7 +199,6 @@ class SmzdmScraper:
 
             items = self._fetch_page(page)
             if items is None:
-                # 请求失败（区别于空数据），跳过继续下一页
                 continue
             if not items:
                 logging.info(f"第{page}页无数据，停止扫描")
@@ -130,7 +211,6 @@ class SmzdmScraper:
                 if not parsed:
                     continue
 
-                # 时间窗口检查 (超过指定小时数则停止扫描后续)
                 if parsed.get('age_hours', 0) > CONFIG['max_history_hours']:
                     logging.info(f"扫到 {parsed['age_hours']:.1f} 小时前的数据，达到时间上限 {CONFIG['max_history_hours']} 小时，停止扫描。")
                     stop_scanning = True
@@ -140,25 +220,16 @@ class SmzdmScraper:
                     self.stats['total_duplicates'] += 1
                     continue
 
-                # 第一阶段：互动数据筛选
+                # 第一阶段：综合评分筛选
                 if not self._filter_stage1(parsed):
                     self.stats['total_filtered_stage1'] += 1
                     continue
 
-                # 第二阶段：水军检测
-                if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
-                    self.stats['total_filtered_shill'] += 1
-                    continue
-
-                # 推送
-                if self._send_notification(parsed):
-                    self._save_history(parsed)
-                    self.stats['total_sent'] += 1
+                candidates.append(parsed)
 
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
-        self._print_statistics()
-        self._cleanup()
+        return candidates
 
     def _fetch_page(self, page):
         """获取列表页数据"""
@@ -170,8 +241,8 @@ class SmzdmScraper:
             )
             if response.status_code != 200:
                 logging.warning(f"第{page}页 HTTP {response.status_code}")
-                return None  # 区分请求失败和空数据
-            
+                return None
+
             resp_json = response.json()
             if isinstance(resp_json, dict):
                 data = resp_json.get('data', {})
@@ -184,14 +255,14 @@ class SmzdmScraper:
             return []
         except Exception as e:
             logging.error(f"第{page}页请求异常: {e}")
-            return None  # 请求失败，返回 None 让调用方跳过而非停止
+            return None
 
     def _parse_item(self, item):
         """解析单个商品数据"""
         if not item or 'article_id' not in item:
             return None
 
-        # 频道白名单过滤（只保留好价相关内容，过滤掉原创文章等）
+        # 频道白名单过滤
         channel_type = str(item.get('article_channel_type', '')).strip()
         whitelist = CONFIG.get('whitelist_channel_types')
         if whitelist and channel_type not in whitelist:
@@ -249,18 +320,16 @@ class SmzdmScraper:
     # ==================== 筛选 ====================
 
     def _filter_stage1(self, parsed):
-        """第一阶段：互动数据筛选"""
+        """第一阶段：综合评分筛选"""
         comments = parsed['comments']
         collection = parsed['collection']
         worthy = parsed['worthy']
         unworthy = parsed['unworthy']
+        weights = CONFIG['score_weights']
 
-        # 所有互动指标都需达标
-        if comments < CONFIG['min_comments']:
-            return False
-        if collection < CONFIG['min_collection']:
-            return False
-        if worthy < CONFIG['min_worthy']:
+        # 基础门槛：总互动量
+        total_engagement = comments + collection + worthy
+        if total_engagement < CONFIG['min_total_engagement']:
             return False
 
         # 好评率检查
@@ -270,14 +339,85 @@ class SmzdmScraper:
             if score_rate < CONFIG['min_score_rate']:
                 return False
 
+        # 综合评分
+        composite_score = (comments * weights['comments']
+                           + collection * weights['collection']
+                           + worthy * weights['worthy'])
+        if composite_score < CONFIG['min_composite_score']:
+            return False
+
         logging.info(
-            f"[粗筛通过] {parsed['title'][:40]}... | "
-            f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
+            f"[综合评分通过] {parsed['title'][:40]}... | "
+            f"评分:{composite_score} 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
 
+    def _check_user_levels(self, parsed):
+        """第二阶段：用户等级水军检测 - 通过 Playwright 抓取评论区用户等级
+
+        水军账号通常等级较低（<Lv6），如果评论区低等级用户占比过高则判定水军。
+        """
+        comments_count = parsed['comments']
+
+        # 评论太少，样本不足，跳过检测
+        if comments_count < CONFIG['level_check_min_comments']:
+            return True
+
+        self._init_browser()
+        if not self.browser_page:
+            logging.warning(f"[等级检测跳过] 浏览器未就绪，放行: {parsed['title'][:40]}...")
+            return True
+
+        try:
+            url = parsed['link']
+            self.browser_page.goto(url, wait_until='domcontentloaded', timeout=20000)
+            # 等待评论区加载
+            self.browser_page.wait_for_selector('img[src*="/level/"]', timeout=10000)
+
+            # 提取所有评论用户等级
+            levels = self.browser_page.evaluate('''() => {
+                const imgs = document.querySelectorAll('img[src*="/level/"]');
+                const levels = [];
+                imgs.forEach(img => {
+                    const m = img.src.match(/\\/level\\/(\\d+)\\.png/);
+                    if (m) levels.push(parseInt(m[1]));
+                });
+                return levels;
+            }''')
+
+            if not levels:
+                logging.info(f"[等级检测跳过] 未获取到用户等级数据，放行: {parsed['title'][:40]}...")
+                return True
+
+            threshold = CONFIG['level_normal_threshold']
+            low_count = sum(1 for lv in levels if lv < threshold)
+            low_ratio = low_count / len(levels)
+
+            # 统计等级分布
+            dist = {}
+            for lv in levels:
+                dist[lv] = dist.get(lv, 0) + 1
+            dist_str = ' '.join(f'Lv{k}:{v}' for k, v in sorted(dist.items()))
+
+            if low_ratio > CONFIG['level_shill_low_ratio']:
+                logging.warning(
+                    f"[等级水军] {parsed['title'][:40]}... | "
+                    f"低等级占比:{low_ratio:.0%} ({low_count}/{len(levels)}) | {dist_str}"
+                )
+                return False
+
+            logging.info(
+                f"[等级检测通过] {parsed['title'][:40]}... | "
+                f"低等级占比:{low_ratio:.0%} ({low_count}/{len(levels)}) | {dist_str}"
+            )
+            return True
+
+        except Exception as e:
+            logging.warning(f"[等级检测异常] {parsed['title'][:40]}... | {e}，放行")
+            return True
+
     def _check_shill(self, parsed):
-        """第二阶段：水军检测 - 基于互动数据异常分析
+        """第三阶段：互动数据水军检测兜底
 
         水军贴典型特征：
         1. 值票极高但几乎无不值票（正常商品会有一定反对声音）
@@ -294,7 +434,7 @@ class SmzdmScraper:
 
         reasons = []
 
-        # 检查1：值/不值比例异常（水军只刷值不刷不值）
+        # 检查1：值/不值比例异常
         if unworthy == 0:
             wu_ratio = float('inf')
         else:
@@ -303,7 +443,7 @@ class SmzdmScraper:
         if wu_ratio > CONFIG['shill_max_worthy_unworthy_ratio']:
             reasons.append(f"值/不值比异常: {worthy}/{unworthy}")
 
-        # 检查2：有票无评论（水军刷值票但不写评论）
+        # 检查2：有票无评论
         if worthy > 0:
             comment_ratio = comments / worthy
             if comment_ratio < CONFIG['shill_min_comment_worthy_ratio']:
@@ -390,12 +530,14 @@ class SmzdmScraper:
         logging.info(f"扫描完成:")
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
-        logging.info(f"  粗筛过滤: {self.stats['total_filtered_stage1']}")
-        logging.info(f"  水军过滤: {self.stats['total_filtered_shill']}")
+        logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
+        logging.info(f"  等级水军过滤: {self.stats['total_filtered_level']}")
+        logging.info(f"  数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)
 
     def _cleanup(self):
+        self._close_browser()
         if hasattr(self, 'conn'):
             self.conn.close()
         if hasattr(self, 'session'):
