@@ -34,5 +34,5 @@
 1. **配置 Secrets**: 在 GitHub 仓库设置中添加 `WXPUSHER_APP_TOKEN` 和 `WXPUSHER_UID`。
 2. **环境要求**: 本项目需要安装 `playwright` 及其浏览器内核（见 workflow 配置）。
 
----
+--
 *注：本项目仅供技术研究与学习，请勿用于商业用途。*
