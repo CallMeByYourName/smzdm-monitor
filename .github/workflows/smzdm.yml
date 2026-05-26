@@ -5,10 +5,10 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
-# 修复这里的并发配置，为 group 加上单引号
-concurrency:
-  group: 'smzdm-scan'
-  cancel-in-progress: false
+# 先完全注释掉这段，排除并发引擎的影响
+# concurrency:
+#   group: 'smzdm-scan'
+#   cancel-in-progress: false
 
 jobs:
   scan:
