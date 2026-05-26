@@ -1,14 +1,11 @@
-name: SMZDM 好价监控
+name: SMZDM 好价监控 NEW
 
 on:
   schedule:
     - cron: '*/30 * * * *'
-  workflow_dispatch:
-
-# 先完全注释掉这段，排除并发引擎的影响
-# concurrency:
-#   group: 'smzdm-scan'
-#   cancel-in-progress: false
+  workflow_dispatch: # 保留它
+  repository_dispatch:
+    types: [cron_trigger] # 自定义一个事件名称
 
 jobs:
   scan:
