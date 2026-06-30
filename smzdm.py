@@ -138,6 +138,7 @@ class SmzdmScraper:
         self.channel_link_exhausted = set()
         self.jd_self_checks = 0
         self.jd_self_check_limit = CONFIG['jd_self_check_min_per_run']
+        self.jd_fetch_debug = []
         self.comment_level_checks = 0
         self.external_checks_suspended = False
 
@@ -576,6 +577,7 @@ class SmzdmScraper:
         if self.jd_self_checks >= self.jd_self_check_limit:
             return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
         self.jd_self_checks += 1
+        self.jd_fetch_debug = []
 
         jd_url = self._resolve_smzdm_go_link(article_link, parsed.get('link'))
         if not jd_url:
@@ -588,11 +590,12 @@ class SmzdmScraper:
                 jd_url,
                 headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept-Encoding': 'identity',
                 },
                 timeout=CONFIG['timeout'],
                 allow_redirects=True
             )
+            self._record_jd_fetch_debug('direct', response)
             if self._is_waf_response(response):
                 self._suspend_external_checks("京东商品页触发反爬/验证码")
                 return self._handle_jd_unverified(parsed, "京东商品页触发反爬/验证码")
@@ -616,6 +619,11 @@ class SmzdmScraper:
         if is_self is False:
             logging.warning(f"[京东非自营过滤] {parsed['title'][:40]}... | {jd_url}")
             return False
+        if self.jd_fetch_debug:
+            logging.warning(
+                f"[京东判定诊断] #{parsed['id']} {parsed['title'][:30]}... | "
+                + " ; ".join(self.jd_fetch_debug)
+            )
         return self._handle_jd_unverified(parsed, "京东商品页未找到 isSelf")
 
     def _handle_jd_unverified(self, parsed, reason):
@@ -633,11 +641,12 @@ class SmzdmScraper:
                 jd_url,
                 headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept-Encoding': 'identity',
                 },
                 timeout=CONFIG['timeout'],
                 allow_redirects=True
             )
+            self._record_jd_fetch_debug('canonical', response)
             if self._is_waf_response(response):
                 self._suspend_external_checks("京东 canonical 商品页触发反爬/验证码")
                 return None
@@ -656,7 +665,7 @@ class SmzdmScraper:
                 mobile_url,
                 headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept-Encoding': 'identity',
                     'Referer': jd_url,
                     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
                                   'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
@@ -664,6 +673,7 @@ class SmzdmScraper:
                 timeout=CONFIG['timeout'],
                 allow_redirects=True
             )
+            self._record_jd_fetch_debug('mobile', response)
             if self._is_waf_response(response):
                 self._suspend_external_checks("京东移动商品页触发反爬/验证码")
                 return None
@@ -671,6 +681,20 @@ class SmzdmScraper:
         except Exception as e:
             logging.warning(f"京东移动商品页请求异常: {e}")
             return None
+
+    def _record_jd_fetch_debug(self, label, response):
+        text = response.text or ''
+        markers = []
+        for marker in ['isSelf', 'shopName', '自营', 'passport', '验证', '风险']:
+            if marker in text:
+                markers.append(marker)
+        prefix = re.sub(r'\s+', ' ', text[:80]).strip()
+        if len(prefix) > 40:
+            prefix = prefix[:40]
+        self.jd_fetch_debug.append(
+            f"{label}:http={response.status_code},ce={response.headers.get('content-encoding') or '-'},"
+            f"len={len(text)},markers={','.join(markers) or '-'},head={prefix or '-'}"
+        )
 
     @staticmethod
     def _build_jd_canonical_url(jd_url):
