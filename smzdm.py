@@ -11,6 +11,7 @@ import random
 import logging
 import re
 import html
+import json
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -45,6 +46,7 @@ CONFIG = {
     "discussion_min_total_engagement": 20,
     "discussion_min_composite_score": 70,
     "emerging_min_worthy": 4,            # 早期好价路径：低评论但值票/收藏快速增长
+    "emerging_min_comments": 2,
     "emerging_min_total_engagement": 8,
     "emerging_min_composite_score": 18,
     "emerging_min_score_rate": 85,
@@ -223,6 +225,7 @@ class SmzdmScraper:
 
         # 第一轮：API 扫描 + 综合评分筛选，收集候选商品
         candidates = self._scan_and_filter_stage1()
+        candidates = self._prioritize_candidates(candidates)
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
 
@@ -355,13 +358,14 @@ class SmzdmScraper:
 
         # 解析 tongji_hudong 获取精确数据
         tongji = self._parse_tongji_hudong(item.get('tongji_hudong', ''))
+        article_link = self._extract_article_link(item)
 
         return {
             'id': article_id,
             'title': title,
             'price': str(item.get('article_price', '未知')).strip(),
             'link': str(item.get('article_url', '')).strip(),
-            'article_link': str(item.get('article_link', '')).strip(),
+            'article_link': article_link,
             'channel_type': channel_type,
             'mall': str(item.get('article_mall', '未知')).strip(),
             'pub_time': str(item.get('article_format_date', '')).strip(),
@@ -373,6 +377,31 @@ class SmzdmScraper:
             'fingerprint': self._build_title_fingerprint(title),
             'price_value': self._parse_price_value(item.get('article_price', '')),
         }
+
+    def _extract_article_link(self, item):
+        article_link = str(item.get('article_link') or '').strip()
+        if article_link:
+            return article_link
+
+        redirect_data = item.get('redirect_data') or {}
+        if isinstance(redirect_data, str):
+            try:
+                redirect_data = json.loads(redirect_data)
+            except json.JSONDecodeError:
+                redirect_data = {}
+        if not isinstance(redirect_data, dict):
+            return ''
+
+        md5_url = str(redirect_data.get('md5_url') or '').strip()
+        if not md5_url:
+            return ''
+        if md5_url.startswith(('http://', 'https://')):
+            return md5_url
+        # 列表接口常见的 md5_url 只有 32 位哈希，直接拼 go.smzdm.com 会 404；
+        # 只有拿到完整路径片段时才作为 article_link 回退。
+        if '/' not in md5_url:
+            return ''
+        return f"https://go.smzdm.com/{md5_url.lstrip('/')}"
 
     def _parse_tongji_hudong(self, tongji_str):
         """解析 tongji_hudong 字段：评论_5,收藏_3,值_10,不值_2"""
@@ -461,6 +490,7 @@ class SmzdmScraper:
               and score_rate >= CONFIG['min_score_rate_relaxed']):
             quality_path = '高讨论'
         elif (worthy >= CONFIG['emerging_min_worthy']
+              and comments >= CONFIG['emerging_min_comments']
               and total_engagement >= CONFIG['emerging_min_total_engagement']
               and composite_score >= CONFIG['emerging_min_composite_score']
               and score_rate >= CONFIG['emerging_min_score_rate']):
@@ -479,6 +509,26 @@ class SmzdmScraper:
             f"评分:{composite_score} 好评率:{parsed['score_rate']}% 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
+
+    def _prioritize_candidates(self, candidates):
+        """把有限的外部校验预算优先用在更可靠的候选上。"""
+        path_rank = {
+            '高讨论': 3,
+            '均衡热度': 2,
+            '早期好价': 1,
+        }
+
+        def priority(parsed):
+            return (
+                path_rank.get(parsed.get('quality_path'), 0),
+                parsed.get('composite_score', 0),
+                parsed.get('comments', 0),
+                parsed.get('score_rate', 0),
+                parsed.get('worthy', 0),
+                parsed.get('collection', 0),
+            )
+
+        return sorted(candidates, key=priority, reverse=True)
 
     def _is_excluded_title(self, title):
         return any(keyword in title for keyword in CONFIG.get('excluded_title_keywords', []))
