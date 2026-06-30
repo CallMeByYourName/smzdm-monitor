@@ -10,6 +10,7 @@ import time
 import random
 import logging
 import re
+import html
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -36,18 +37,57 @@ CONFIG = {
     },
     "min_total_engagement": 15,         # 基础门槛：评论+收藏+值 >= 15
     "min_composite_score": 45,          # 综合评分阈值 (略微调高防止低质推送)
-    "min_score_rate": 80,               # 好评率 >= 70%
+    "min_score_rate": 70,               # 均衡路径好评率
+    "min_score_rate_relaxed": 55,        # 高讨论路径的最低好评率，避免错过有争议但真实的好价
+    "min_signal_worthy": 2,              # 至少有值票或评论信号，避免纯收藏/纯券活动
+    "min_signal_comments": 2,
+    "discussion_min_comments": 8,        # 高讨论路径：评论多、互动强时允许较低好评率
+    "discussion_min_total_engagement": 20,
+    "discussion_min_composite_score": 70,
+    "emerging_min_worthy": 4,            # 早期好价路径：低评论但值票/收藏快速增长
+    "emerging_min_total_engagement": 8,
+    "emerging_min_composite_score": 18,
+    "emerging_min_score_rate": 85,
+    "excluded_title_keywords": [         # 非商品类、易重复推送的活动信息
+        "支付立减券",
+        "无门槛券",
+        "红包",
+        "话费券",
+        "签到",
+    ],
 
-    # 第二阶段：水军检测兜底（基于异常分析，需同时满足多项）
+    # 第二阶段：京东自营校验（基于真实跳转链路解析京东商品页 isSelf 字段）
+    "jd_self_filter_enabled": True,
+    "jd_link_lookup_pages": 6,           # 当前列表接口不带 article_link，按频道接口最多回查页数
+    "jd_link_lookup_page_size": 50,
+    "jd_reject_when_unverified": True,   # 京东商品无法确认自营时拒绝，避免放过非自营
+    "max_jd_self_checks_per_run": 5,      # 控制 go.smzdm/jd 外部链路请求量
+
+    # 第三阶段：评论用户等级水军检测（haojia.m.smzdm.com 真实 JSON 的 vip_level）
+    "comment_level_check_enabled": True,
+    "comment_level_low_max": 5,          # Lv5 及以下视为低等级/新号
+    "comment_level_high_min": 6,         # Lv6 及以上视为真实用户倾向
+    "comment_level_min_comments": 3,     # 可取到的评论数少于此值时不做等级判断
+    "comment_level_max_low_ratio": 0.5,  # 低等级评论用户占比超过 50% 则过滤
+    "max_comment_level_checks_per_run": 8,
+
+    # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
     "shill_min_votes_for_check": 30,        # 总投票数少于此值时跳过水军检测
     "shill_max_worthy_unworthy_ratio": 30,  # 值/不值比超过此值则可疑指标+1
     "shill_min_comment_worthy_ratio": 0.15, # 评论数/值票数低于此值则可疑指标+1
     "shill_min_flags": 2,                   # 至少N个可疑指标才标记为水军
 
+    # 去重参数
+    "fingerprint_dedupe_days": 3,       # 同商品标题指纹在 N 天内只推一次
+    "fingerprint_min_len": 8,
+
     # 请求参数
     "request_delay": (0.5, 1.5),        # 随机延迟范围（秒）
+    "external_request_delay": (1.5, 3.5), # 详情/跳转类请求更慢，降低反爬风险
     "timeout": 30,                      # 请求超时（秒），GitHub Actions 到国内 API 延迟较高
+    "waf_status_codes": [202, 403, 429],
+    "waf_markers": ["probe.js", "tcaptcha", "验证码", "captcha", "访问过于频繁"],
 }
 
 # ===== 日志 =====
@@ -64,15 +104,28 @@ class SmzdmScraper:
         self._init_session()
         self._init_database()
         self.seen_ids = set()
+        self.seen_fingerprints = set()
         self._load_existing_ids()
 
         self.stats = {
             'total_fetched': 0,
             'total_sent': 0,
             'total_duplicates': 0,
+            'total_fingerprint_duplicates': 0,
             'total_filtered_stage1': 0,
+            'total_filtered_jd_self': 0,
+            'total_filtered_comment_level': 0,
             'total_filtered_shill': 0,
+            'total_comment_level_unavailable': 0,
+            'total_external_checks_suspended': 0,
         }
+        self.article_link_cache = {}
+        self.channel_article_link_cache = {}
+        self.channel_link_pages_loaded = {}
+        self.channel_link_exhausted = set()
+        self.jd_self_checks = 0
+        self.comment_level_checks = 0
+        self.external_checks_suspended = False
 
     def _init_session(self):
         retry = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
@@ -93,15 +146,39 @@ class SmzdmScraper:
             CREATE TABLE IF NOT EXISTS history (
                 id TEXT PRIMARY KEY,
                 title TEXT,
+                fingerprint TEXT,
+                mall TEXT,
+                price TEXT,
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        self._ensure_history_columns()
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_history_fingerprint ON history (fingerprint, last_seen)')
         self.conn.commit()
+
+    def _ensure_history_columns(self):
+        cursor = self.conn.execute("PRAGMA table_info(history)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        required_columns = {
+            'fingerprint': 'TEXT',
+            'mall': 'TEXT',
+            'price': 'TEXT',
+        }
+        for column, column_type in required_columns.items():
+            if column not in existing_columns:
+                self.conn.execute(f'ALTER TABLE history ADD COLUMN {column} {column_type}')
 
     def _load_existing_ids(self):
         cursor = self.conn.execute("SELECT id FROM history")
         self.seen_ids = {row[0] for row in cursor.fetchall()}
-        logging.info(f"已加载 {len(self.seen_ids)} 条历史记录")
+
+        cutoff = datetime.now() - timedelta(days=CONFIG['fingerprint_dedupe_days'])
+        cursor = self.conn.execute(
+            "SELECT fingerprint FROM history WHERE fingerprint IS NOT NULL AND fingerprint != '' AND last_seen >= ?",
+            (cutoff,)
+        )
+        self.seen_fingerprints = {row[0] for row in cursor.fetchall()}
+        logging.info(f"已加载 {len(self.seen_ids)} 条历史记录，{len(self.seen_fingerprints)} 个近期商品指纹")
 
     # ==================== 扫描 ====================
 
@@ -119,9 +196,16 @@ class SmzdmScraper:
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
 
-        # 第二轮：互动数据水军检测
+        # 第二轮：京东自营、评论等级、互动异常检测
         for parsed in candidates:
-            # 第二阶段：互动数据水军检测兜底
+            if CONFIG['jd_self_filter_enabled'] and not self._check_jd_self_operated(parsed):
+                self.stats['total_filtered_jd_self'] += 1
+                continue
+
+            if CONFIG['comment_level_check_enabled'] and not self._check_comment_user_levels(parsed):
+                self.stats['total_filtered_comment_level'] += 1
+                continue
+
             if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
                 self.stats['total_filtered_shill'] += 1
                 continue
@@ -162,7 +246,7 @@ class SmzdmScraper:
                     stop_scanning = True
                     break
 
-                if self._is_duplicate(parsed['id']):
+                if self._is_duplicate(parsed):
                     self.stats['total_duplicates'] += 1
                     continue
 
@@ -172,7 +256,9 @@ class SmzdmScraper:
                     continue
 
                 candidates.append(parsed)
-                self.seen_ids.add(parsed['id'])  # 立即���记，防止跨页��复
+                self.seen_ids.add(parsed['id'])  # 立即标记，防止跨页重复
+                if parsed.get('fingerprint'):
+                    self.seen_fingerprints.add(parsed['fingerprint'])
 
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
@@ -242,6 +328,8 @@ class SmzdmScraper:
             'title': title,
             'price': str(item.get('article_price', '未知')).strip(),
             'link': str(item.get('article_url', '')).strip(),
+            'article_link': str(item.get('article_link', '')).strip(),
+            'channel_type': channel_type,
             'mall': str(item.get('article_mall', '未知')).strip(),
             'pub_time': str(item.get('article_format_date', '')).strip(),
             'comments': tongji['comments'] or comments,
@@ -249,6 +337,7 @@ class SmzdmScraper:
             'worthy': tongji['worthy'] or worthy,
             'unworthy': tongji['unworthy'] or unworthy,
             'age_hours': age_hours,
+            'fingerprint': self._build_title_fingerprint(title),
         }
 
     def _parse_tongji_hudong(self, tongji_str):
@@ -264,6 +353,27 @@ class SmzdmScraper:
                     result[mapping[key]] = int(value)
         return result
 
+    def _build_title_fingerprint(self, title):
+        """生成跨文章 ID 的商品指纹，降低重复爆料推送。"""
+        text = title.lower()
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'（[^）]*(券|优惠|返|plus|会员|满减|到手|需买|凑单)[^）]*）', '', text)
+        text = re.sub(r'\([^)]*(券|优惠|返|plus|会员|满减|到手|需买|凑单)[^)]*\)', '', text)
+
+        promo_words = [
+            'plus会员', '88vip', '值友专享', '今日必买', '百亿补贴', '淘金币可用',
+            '历史低价', '历史新低', '新低价', '新低', '限地区', '限时', '临期品',
+            '凑单品', '需用券', '券后', '下单立减', '满减', '可用券', '可用',
+        ]
+        for word in promo_words:
+            text = text.replace(word, '')
+
+        text = re.sub(r'\d+(\.\d+)?\s*元.*$', '', text)
+        text = re.sub(r'[^\w\u4e00-\u9fff]+', '', text)
+        if len(text) < CONFIG['fingerprint_min_len']:
+            return ''
+        return text[:80]
+
     # ==================== 筛选 ====================
 
     def _filter_stage1(self, parsed):
@@ -274,38 +384,438 @@ class SmzdmScraper:
         unworthy = parsed['unworthy']
         weights = CONFIG['score_weights']
 
+        if self._is_excluded_title(parsed['title']):
+            return False
+
+        if worthy < CONFIG['min_signal_worthy'] and comments < CONFIG['min_signal_comments']:
+            return False
+
         # 基础门槛：总互动量
         total_engagement = comments + collection + worthy
-        if total_engagement < CONFIG['min_total_engagement']:
-            return False
 
         # 好评率检查
         total_votes = worthy + unworthy
-        if total_votes > 0:
-            score_rate = worthy / total_votes * 100
-            if score_rate < CONFIG['min_score_rate']:
-                return False
+        score_rate = worthy / total_votes * 100 if total_votes > 0 else 100
+        if total_votes >= 3 and score_rate < CONFIG['min_score_rate_relaxed']:
+            return False
 
         # 综合评分
         composite_score = (comments * weights['comments']
                            + collection * weights['collection']
                            + worthy * weights['worthy'])
-        if composite_score < CONFIG['min_composite_score']:
+
+        quality_path = ''
+        if (total_engagement >= CONFIG['min_total_engagement']
+                and composite_score >= CONFIG['min_composite_score']
+                and score_rate >= CONFIG['min_score_rate']):
+            quality_path = '均衡热度'
+        elif (comments >= CONFIG['discussion_min_comments']
+              and total_engagement >= CONFIG['discussion_min_total_engagement']
+              and composite_score >= CONFIG['discussion_min_composite_score']
+              and score_rate >= CONFIG['min_score_rate_relaxed']):
+            quality_path = '高讨论'
+        elif (worthy >= CONFIG['emerging_min_worthy']
+              and total_engagement >= CONFIG['emerging_min_total_engagement']
+              and composite_score >= CONFIG['emerging_min_composite_score']
+              and score_rate >= CONFIG['emerging_min_score_rate']):
+            quality_path = '早期好价'
+
+        if not quality_path:
             return False
 
         # 好评率和综合评分挂到 parsed 上，供推送使用
-        total_votes = worthy + unworthy
-        parsed['score_rate'] = round(worthy / total_votes * 100) if total_votes > 0 else 100
+        parsed['score_rate'] = round(score_rate) if total_votes > 0 else 100
         parsed['composite_score'] = composite_score
+        parsed['quality_path'] = quality_path
 
         logging.info(
-            f"[综合评分通过] {parsed['title'][:40]}... | "
-            f"评分:{composite_score} 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
+            f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
+            f"评分:{composite_score} 好评率:{parsed['score_rate']}% 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
 
+    def _is_excluded_title(self, title):
+        return any(keyword in title for keyword in CONFIG.get('excluded_title_keywords', []))
+
+    def _check_jd_self_operated(self, parsed):
+        """京东渠道只放行京东自营商品。
+
+        当前主列表接口只返回 article_mall=京东，不含店铺名；实测频道列表
+        article_link 可解析到京东商品页，商品页 HTML 中有 isSelf:true/false。
+        """
+        if parsed['mall'] != '京东':
+            return True
+
+        if self.external_checks_suspended:
+            return self._handle_jd_unverified(parsed, "外部校验已熔断")
+        if self.jd_self_checks >= CONFIG['max_jd_self_checks_per_run']:
+            return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
+        self.jd_self_checks += 1
+
+        article_link = self._get_article_link(parsed)
+        if not article_link:
+            return self._handle_jd_unverified(parsed, "未找到 article_link")
+
+        jd_url = self._resolve_smzdm_go_link(article_link, parsed.get('link'))
+        if not jd_url:
+            return self._handle_jd_unverified(parsed, "无法解析 SMZDM 跳转链接")
+
+        parsed['jd_url'] = jd_url
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                jd_url,
+                headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
+                timeout=CONFIG['timeout'],
+                allow_redirects=True
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("京东商品页触发反爬/验证码")
+                return self._handle_jd_unverified(parsed, "京东商品页触发反爬/验证码")
+            html_text = response.text
+        except Exception as e:
+            return self._handle_jd_unverified(parsed, f"京东商品页请求异常: {e}")
+
+        is_self = self._extract_jd_is_self(html_text)
+        if is_self is True:
+            logging.info(f"[京东自营通过] {parsed['title'][:40]}... | {jd_url}")
+            return True
+        if is_self is False:
+            logging.warning(f"[京东非自营过滤] {parsed['title'][:40]}... | {jd_url}")
+            return False
+        return self._handle_jd_unverified(parsed, "京东商品页未找到 isSelf")
+
+    def _handle_jd_unverified(self, parsed, reason):
+        action = "过滤" if CONFIG['jd_reject_when_unverified'] else "放行"
+        logging.warning(f"[京东自营无法确认，{action}] {parsed['title'][:40]}... | {reason}")
+        return not CONFIG['jd_reject_when_unverified']
+
+    def _get_article_link(self, parsed):
+        article_link = parsed.get('article_link')
+        if article_link:
+            return article_link
+
+        article_id = parsed['id']
+        if article_id in self.article_link_cache:
+            return self.article_link_cache[article_id]
+
+        endpoints = []
+        if parsed.get('channel_type') == 'faxian':
+            endpoints.append('faxian/list')
+        elif parsed.get('channel_type') == 'youhui':
+            endpoints.append('youhui/list')
+        endpoints.extend(['youhui/list', 'faxian/list'])
+
+        for endpoint in dict.fromkeys(endpoints):
+            found = self._lookup_article_link_from_channel_api(article_id, endpoint)
+            if found:
+                self.article_link_cache[article_id] = found
+                return found
+
+        self.article_link_cache[article_id] = ''
+        return ''
+
+    def _lookup_article_link_from_channel_api(self, article_id, endpoint):
+        endpoint_cache = self.channel_article_link_cache.setdefault(endpoint, {})
+        if article_id in endpoint_cache:
+            return endpoint_cache[article_id]
+        if endpoint in self.channel_link_exhausted:
+            return ''
+
+        page_size = CONFIG['jd_link_lookup_page_size']
+        start_page = self.channel_link_pages_loaded.get(endpoint, 0)
+        for page in range(start_page, CONFIG['jd_link_lookup_pages']):
+            offset = page * page_size
+            url = f'https://api.smzdm.com/v1/{endpoint}?limit={page_size}&offset={offset}&version=2'
+            try:
+                response = self.session.get(url, timeout=CONFIG['timeout'])
+                if response.status_code != 200:
+                    continue
+                resp_json = response.json()
+            except Exception as e:
+                logging.warning(f"article_link 回查失败 {endpoint} offset={offset}: {e}")
+                continue
+
+            rows = (resp_json.get('data') or {}).get('rows') if isinstance(resp_json, dict) else []
+            if not rows:
+                self.channel_link_exhausted.add(endpoint)
+                break
+
+            for item in rows:
+                item_id = str(item.get('article_id', '')).strip()
+                if item_id:
+                    endpoint_cache[item_id] = str(item.get('article_link', '')).strip()
+            self.channel_link_pages_loaded[endpoint] = page + 1
+
+            if article_id in endpoint_cache:
+                return endpoint_cache[article_id]
+            time.sleep(0.1)
+        return ''
+
+    def _resolve_smzdm_go_link(self, article_link, referer):
+        """解析 SMZDM go 链接到最终京东商品链接。"""
+        if self.external_checks_suspended:
+            return ''
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                article_link,
+                headers={
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': referer or 'https://www.smzdm.com/',
+                },
+                timeout=CONFIG['timeout'],
+                allow_redirects=False
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("SMZDM 跳转页触发反爬/验证码")
+                return ''
+        except Exception as e:
+            logging.warning(f"SMZDM 跳转页请求失败: {e}")
+            return ''
+
+        target = response.headers.get('Location', '')
+        if not target:
+            target = self._extract_smzdmhref(response.text)
+        if not target:
+            return ''
+
+        if 'union-click.jd.com/jdc' in target:
+            return self._resolve_jd_union_link(target)
+        if 'item.jd.com/' in target or 'item.m.jd.com/' in target:
+            return target
+        return ''
+
+    def _extract_smzdmhref(self, page_text):
+        match = re.search(r"smzdmhref\s*=\s*['\"]([^'\"]+)['\"]", page_text)
+        if match:
+            return html.unescape(match.group(1))
+
+        unpacked = self._unpack_packer_js(page_text)
+        unpacked = unpacked.replace("\\'", "'").replace('\\"', '"').replace('\\/', '/')
+        match = re.search(r"smzdmhref\s*=\s*['\"]([^'\"]+)['\"]", unpacked)
+        if match:
+            return html.unescape(match.group(1))
+        return ''
+
+    def _unpack_packer_js(self, page_text):
+        match = re.search(
+            r"eval\((function\(p,a,c,k,e,d\).*?\}\('(?P<payload>.*?)',(?P<base>\d+),(?P<count>\d+),'(?P<words>.*?)'\.split\('\|'\),0,\{\}\))\)",
+            page_text,
+            re.DOTALL
+        )
+        if not match:
+            return ''
+
+        payload = match.group('payload')
+        base = int(match.group('base'))
+        count = int(match.group('count'))
+        words = match.group('words').split('|')
+        if count > len(words):
+            words.extend([''] * (count - len(words)))
+
+        for index in range(count - 1, -1, -1):
+            word = words[index]
+            if not word:
+                continue
+            payload = re.sub(rf'\b{self._base_n(index, base)}\b', lambda _match: word, payload)
+        return payload
+
+    @staticmethod
+    def _base_n(num, base):
+        chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        if num == 0:
+            return '0'
+        result = ''
+        while num:
+            num, rem = divmod(num, base)
+            result = chars[rem] + result
+        return result
+
+    def _resolve_jd_union_link(self, union_url):
+        if self.external_checks_suspended:
+            return ''
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                union_url,
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Referer': 'https://www.smzdm.com/',
+                },
+                timeout=CONFIG['timeout'],
+                allow_redirects=False
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("京东联盟链接触发反爬/验证码")
+                return ''
+        except Exception as e:
+            logging.warning(f"京东联盟链接请求失败: {e}")
+            return ''
+
+        location = response.headers.get('Location', '')
+        if location:
+            return requests.compat.urljoin(union_url, location)
+
+        match = re.search(r"https://union-click\.jd\.com/jda\?[^'\"<>]+", response.text)
+        if not match:
+            return ''
+
+        jump_url = html.unescape(match.group(0))
+        if 'h5st=' not in jump_url:
+            jump_url = f"{jump_url}&h5st={self._js_hash_code(self.session.headers.get('User-Agent', ''))}"
+
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                jump_url,
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Referer': 'https://www.smzdm.com/',
+                },
+                timeout=CONFIG['timeout'],
+                allow_redirects=False
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("京东联盟二跳触发反爬/验证码")
+                return ''
+        except Exception as e:
+            logging.warning(f"京东联盟二跳请求失败: {e}")
+            return ''
+
+        location = response.headers.get('Location', '')
+        if location:
+            return requests.compat.urljoin(jump_url, location)
+        return ''
+
+    @staticmethod
+    def _js_hash_code(value):
+        result = 0
+        for char in value:
+            result = ((result << 5) - result + ord(char)) & 0xffffffff
+        if result >= 0x80000000:
+            result -= 0x100000000
+        return result
+
+    @staticmethod
+    def _extract_jd_is_self(html_text):
+        if re.search(r'\bisSelf\s*:\s*true\b', html_text):
+            return True
+        if re.search(r'\bisSelf\s*:\s*false\b', html_text):
+            return False
+        if '京东自营' in html_text or '自营旗舰店' in html_text:
+            return True
+        return None
+
+    def _check_comment_user_levels(self, parsed):
+        """根据评论 JSON 中的 vip_level 识别低等级账号占比。"""
+        if self.external_checks_suspended:
+            self.stats['total_comment_level_unavailable'] += 1
+            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 外部校验已熔断")
+            return True
+        if self.comment_level_checks >= CONFIG['max_comment_level_checks_per_run']:
+            self.stats['total_comment_level_unavailable'] += 1
+            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 达到本轮评论等级校验上限")
+            return True
+        self.comment_level_checks += 1
+
+        levels = self._fetch_comment_user_levels(parsed['id'])
+        if len(levels) < CONFIG['comment_level_min_comments']:
+            if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
+                self.stats['total_comment_level_unavailable'] += 1
+                logging.info(
+                    f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
+                    f"API评论:{parsed['comments']} 可取等级:{len(levels)}"
+                )
+            return True
+
+        low_count = sum(1 for level in levels if level <= CONFIG['comment_level_low_max'])
+        high_count = sum(1 for level in levels if level >= CONFIG['comment_level_high_min'])
+        low_ratio = low_count / len(levels)
+
+        parsed['comment_level_stats'] = {
+            'count': len(levels),
+            'low': low_count,
+            'high': high_count,
+            'low_ratio': round(low_ratio, 2),
+        }
+
+        if low_ratio > CONFIG['comment_level_max_low_ratio']:
+            logging.warning(
+                f"[评论等级水军过滤] {parsed['title'][:40]}... | "
+                f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
+                f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
+            )
+            return False
+
+        logging.info(
+            f"[评论等级通过] {parsed['title'][:40]}... | "
+            f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
+            f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
+        )
+        return True
+
+    def _fetch_comment_user_levels(self, article_id):
+        url = f'https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}'
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                url,
+                headers={
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': f'https://www.smzdm.com/p/{article_id}/',
+                },
+                timeout=CONFIG['timeout']
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("评论等级接口触发反爬/验证码")
+                return []
+            if response.status_code != 200:
+                logging.warning(f"评论等级接口 HTTP {response.status_code}: {article_id}")
+                return []
+            resp_json = response.json()
+        except Exception as e:
+            logging.warning(f"评论等级接口请求失败 {article_id}: {e}")
+            return []
+
+        levels = []
+        self._collect_comment_levels(resp_json, levels)
+        return levels
+
+    def _collect_comment_levels(self, node, levels):
+        if isinstance(node, dict):
+            if 'comment_id' in node and 'vip_level' in node and not node.get('display_author'):
+                try:
+                    levels.append(int(node['vip_level']))
+                except (TypeError, ValueError):
+                    pass
+            for value in node.values():
+                self._collect_comment_levels(value, levels)
+        elif isinstance(node, list):
+            for value in node:
+                self._collect_comment_levels(value, levels)
+
+    def _throttle_external_request(self):
+        time.sleep(random.uniform(*CONFIG['external_request_delay']))
+
+    def _is_waf_response(self, response):
+        if response.status_code in CONFIG['waf_status_codes']:
+            return True
+        content_type = response.headers.get('content-type', '')
+        text = response.text[:5000].lower()
+        looks_like_html = 'text/html' in content_type or text.lstrip().startswith(('<!doctype', '<html', '<script'))
+        if not looks_like_html:
+            return False
+        return any(marker.lower() in text for marker in CONFIG['waf_markers'])
+
+    def _suspend_external_checks(self, reason):
+        if not self.external_checks_suspended:
+            self.external_checks_suspended = True
+            self.stats['total_external_checks_suspended'] += 1
+            logging.warning(f"[外部校验熔断] {reason}，本轮停止详情/跳转类请求")
+
     def _check_shill(self, parsed):
-        """第三阶段：互动数据水军检测兜底
+        """第四阶段：互动数据水军检测兜底
 
         水军贴典型特征：
         1. 值票极高但几乎无不值票（正常商品会有一定反对声音）
@@ -352,6 +862,7 @@ class SmzdmScraper:
         """WXPusher 微信推送"""
         score_rate = data.get('score_rate', 0)
         composite_score = data.get('composite_score', 0)
+        quality_path = data.get('quality_path', '综合筛选')
 
         # 评分等级标记
         if composite_score >= 100:
@@ -369,6 +880,7 @@ class SmzdmScraper:
         💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
         👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
         📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
+        🧭 筛选：{quality_path}<br>
         <br>
         🔗 <a href='{data['link']}'>点击查看详情</a>
         """
@@ -402,16 +914,37 @@ class SmzdmScraper:
     # ==================== 数据库 ====================
 
     def _is_duplicate(self, article_id):
+        if isinstance(article_id, dict):
+            parsed = article_id
+            if parsed['id'] in self.seen_ids:
+                return True
+            fingerprint = parsed.get('fingerprint')
+            if fingerprint and fingerprint in self.seen_fingerprints:
+                self.stats['total_fingerprint_duplicates'] += 1
+                logging.info(f"[相似商品重复跳过] {parsed['title'][:40]}... | 指纹:{fingerprint}")
+                return True
+            return False
         return article_id in self.seen_ids
 
     def _save_history(self, data):
         try:
             self.conn.execute(
-                'INSERT OR REPLACE INTO history (id, title) VALUES (?, ?)',
-                (data['id'], data['title'][:100])
+                '''
+                INSERT OR REPLACE INTO history (id, title, fingerprint, mall, price, last_seen)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ''',
+                (
+                    data['id'],
+                    data['title'][:100],
+                    data.get('fingerprint', ''),
+                    data.get('mall', ''),
+                    data.get('price', ''),
+                )
             )
             self.conn.commit()
             self.seen_ids.add(data['id'])
+            if data.get('fingerprint'):
+                self.seen_fingerprints.add(data['fingerprint'])
         except Exception as e:
             logging.error(f"保存历史失败: {e}")
 
@@ -430,8 +963,13 @@ class SmzdmScraper:
         logging.info(f"扫描完成:")
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
+        logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
-        logging.info(f"  数据水军过滤: {self.stats['total_filtered_shill']}")
+        logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")
+        logging.info(f"  评论等级水军过滤: {self.stats['total_filtered_comment_level']}")
+        logging.info(f"  评论等级不可用跳过: {self.stats['total_comment_level_unavailable']}")
+        logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
+        logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)
 

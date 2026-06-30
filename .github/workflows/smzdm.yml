@@ -7,6 +7,10 @@ on:
   repository_dispatch:
     types: [cron_trigger] # 自定义一个事件名称
 
+concurrency:
+  group: smzdm-scan
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -19,9 +23,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
       # 从缓存恢复 SQLite 数据库
       - name: Restore database cache
