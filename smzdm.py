@@ -81,6 +81,8 @@ CONFIG = {
     # 去重参数
     "fingerprint_dedupe_days": 3,       # 同商品标题指纹在 N 天内只推一次
     "fingerprint_min_len": 8,
+    "price_drop_min_percent": 5,        # 同商品降价超过 5% 允许再次推送
+    "price_drop_min_amount": 5,         # 或至少便宜 5 元允许再次推送
 
     # 请求参数
     "request_delay": (0.5, 1.5),        # 随机延迟范围（秒）
@@ -105,6 +107,7 @@ class SmzdmScraper:
         self._init_database()
         self.seen_ids = set()
         self.seen_fingerprints = set()
+        self.fingerprint_min_prices = {}
         self._load_existing_ids()
 
         self.stats = {
@@ -149,6 +152,7 @@ class SmzdmScraper:
                 fingerprint TEXT,
                 mall TEXT,
                 price TEXT,
+                price_value REAL,
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -163,10 +167,25 @@ class SmzdmScraper:
             'fingerprint': 'TEXT',
             'mall': 'TEXT',
             'price': 'TEXT',
+            'price_value': 'REAL',
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
                 self.conn.execute(f'ALTER TABLE history ADD COLUMN {column} {column_type}')
+        self._backfill_history_price_values()
+
+    def _backfill_history_price_values(self):
+        cursor = self.conn.execute(
+            "SELECT id, price FROM history WHERE price_value IS NULL AND price IS NOT NULL AND price != ''"
+        )
+        rows = cursor.fetchall()
+        for article_id, price in rows:
+            price_value = self._parse_price_value(price)
+            if price_value is not None:
+                self.conn.execute(
+                    "UPDATE history SET price_value = ? WHERE id = ?",
+                    (price_value, article_id)
+                )
 
     def _load_existing_ids(self):
         cursor = self.conn.execute("SELECT id FROM history")
@@ -174,10 +193,18 @@ class SmzdmScraper:
 
         cutoff = datetime.now() - timedelta(days=CONFIG['fingerprint_dedupe_days'])
         cursor = self.conn.execute(
-            "SELECT fingerprint FROM history WHERE fingerprint IS NOT NULL AND fingerprint != '' AND last_seen >= ?",
+            '''
+            SELECT fingerprint, MIN(price_value)
+            FROM history
+            WHERE fingerprint IS NOT NULL AND fingerprint != '' AND last_seen >= ?
+            GROUP BY fingerprint
+            ''',
             (cutoff,)
         )
-        self.seen_fingerprints = {row[0] for row in cursor.fetchall()}
+        for fingerprint, min_price in cursor.fetchall():
+            self.seen_fingerprints.add(fingerprint)
+            if min_price is not None:
+                self.fingerprint_min_prices[fingerprint] = float(min_price)
         logging.info(f"已加载 {len(self.seen_ids)} 条历史记录，{len(self.seen_fingerprints)} 个近期商品指纹")
 
     # ==================== 扫描 ====================
@@ -341,6 +368,7 @@ class SmzdmScraper:
             'unworthy': tongji['unworthy'] or unworthy,
             'age_hours': age_hours,
             'fingerprint': self._build_title_fingerprint(title),
+            'price_value': self._parse_price_value(item.get('article_price', '')),
         }
 
     def _parse_tongji_hudong(self, tongji_str):
@@ -376,6 +404,18 @@ class SmzdmScraper:
         if len(text) < CONFIG['fingerprint_min_len']:
             return ''
         return text[:80]
+
+    def _parse_price_value(self, price_text):
+        """从价格文本中提取可比较的人民币数值，解析失败返回 None。"""
+        text = str(price_text or '')
+        text = text.replace(',', '')
+        matches = re.findall(r'(\d+(?:\.\d+)?)\s*元', text)
+        if not matches:
+            return None
+        values = [float(value) for value in matches]
+        if any(keyword in text for keyword in ('低至', '折合', '约', '券后', '到手')):
+            return min(values)
+        return values[-1]
 
     # ==================== 筛选 ====================
 
@@ -931,6 +971,7 @@ class SmzdmScraper:
         composite_score = data.get('composite_score', 0)
         quality_path = data.get('quality_path', '综合筛选')
         level_stats = data.get('comment_level_stats') or {}
+        price_drop_note = data.get('price_drop_note')
 
         if composite_score >= 100:
             score_tag = '🔥爆'
@@ -959,6 +1000,9 @@ class SmzdmScraper:
                 f"👤 评论等级：Lv5及以下 {low}/{count}（{low_ratio}%）"
                 f" | Lv6及以上 {high}<br>"
             )
+        price_drop_line = ''
+        if price_drop_note:
+            price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
 
         return f"""
         <div style="font-size:15px;line-height:1.65;">
@@ -972,6 +1016,7 @@ class SmzdmScraper:
           <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
           🕒 发布：{pub_time}<br>
           📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
+          {price_drop_line}
           👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
           💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
           {level_line}
@@ -995,8 +1040,29 @@ class SmzdmScraper:
     def _is_fingerprint_duplicate(self, parsed):
         fingerprint = parsed.get('fingerprint')
         if fingerprint and fingerprint in self.seen_fingerprints:
+            if self._is_meaningful_price_drop(parsed):
+                return False
             self.stats['total_fingerprint_duplicates'] += 1
             logging.info(f"[相似商品重复跳过] {parsed['title'][:40]}... | 指纹:{fingerprint}")
+            return True
+        return False
+
+    def _is_meaningful_price_drop(self, parsed):
+        fingerprint = parsed.get('fingerprint')
+        new_price = parsed.get('price_value')
+        old_price = self.fingerprint_min_prices.get(fingerprint)
+        if new_price is None or old_price is None or old_price <= 0:
+            return False
+
+        drop_amount = old_price - new_price
+        drop_percent = drop_amount / old_price * 100
+        if (drop_amount >= CONFIG['price_drop_min_amount']
+                or drop_percent >= CONFIG['price_drop_min_percent']):
+            parsed['price_drop_note'] = f"较历史推送低 {drop_amount:.2f} 元（{drop_percent:.1f}%）"
+            logging.info(
+                f"[相似商品降价放行] {parsed['title'][:40]}... | "
+                f"历史:{old_price:.2f} 新价:{new_price:.2f} 降幅:{drop_percent:.1f}%"
+            )
             return True
         return False
 
@@ -1004,8 +1070,8 @@ class SmzdmScraper:
         try:
             self.conn.execute(
                 '''
-                INSERT OR REPLACE INTO history (id, title, fingerprint, mall, price, last_seen)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT OR REPLACE INTO history (id, title, fingerprint, mall, price, price_value, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''',
                 (
                     data['id'],
@@ -1013,12 +1079,18 @@ class SmzdmScraper:
                     data.get('fingerprint', ''),
                     data.get('mall', ''),
                     data.get('price', ''),
+                    data.get('price_value'),
                 )
             )
             self.conn.commit()
             self.seen_ids.add(data['id'])
             if data.get('fingerprint'):
                 self.seen_fingerprints.add(data['fingerprint'])
+                price_value = data.get('price_value')
+                if price_value is not None:
+                    old_price = self.fingerprint_min_prices.get(data['fingerprint'])
+                    if old_price is None or price_value < old_price:
+                        self.fingerprint_min_prices[data['fingerprint']] = price_value
         except Exception as e:
             logging.error(f"保存历史失败: {e}")
 
