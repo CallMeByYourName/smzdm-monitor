@@ -61,8 +61,10 @@ CONFIG = {
         "关注领",
     ],
 
-    # 第二阶段：京东自营校验（基于真实跳转链路解析京东商品页 isSelf 字段）
-    "jd_self_filter_enabled": True,
+    # 第二阶段：京东自营校验
+    # GitHub Actions 访问京东商品页经常只拿到无商品字段的云端空壳页；
+    # 默认关闭自营强过滤，京东商品与其他平台一样走评论等级/集中度/互动异常水军判断。
+    "jd_self_filter_enabled": False,
     "jd_link_lookup_pages": 12,          # 当前列表接口不带 article_link，按频道接口最多回查页数
     "jd_link_lookup_page_size": 50,
     "jd_reject_when_unverified": True,   # 京东商品无法确认自营时拒绝，避免放过非自营
@@ -244,9 +246,12 @@ class SmzdmScraper:
         self.jd_self_check_limit = self._calculate_jd_self_check_limit(candidates)
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
-        logging.info(f"京东自营动态校验预算: {self.jd_self_check_limit} 次")
+        if CONFIG['jd_self_filter_enabled']:
+            logging.info(f"京东自营动态校验预算: {self.jd_self_check_limit} 次")
+        else:
+            logging.info("京东自营过滤: 关闭，京东商品按通用水军策略判断")
 
-        # 第二轮：京东自营、评论等级、互动异常检测
+        # 第二轮：可选京东自营、评论等级、互动异常检测
         for parsed in candidates:
             if CONFIG['jd_self_filter_enabled'] and not self._check_jd_self_operated(parsed):
                 self.stats['total_filtered_jd_self'] += 1
@@ -548,6 +553,9 @@ class SmzdmScraper:
         return sorted(candidates, key=priority, reverse=True)
 
     def _calculate_jd_self_check_limit(self, candidates):
+        if not CONFIG.get('jd_self_filter_enabled'):
+            return 0
+
         jd_candidates = sum(1 for parsed in candidates if parsed.get('mall') == '京东')
         if jd_candidates <= 0:
             return 0
@@ -1364,7 +1372,10 @@ class SmzdmScraper:
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
         logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")
-        logging.info(f"  京东自营校验: {self.jd_self_checks}/{self.jd_self_check_limit}")
+        if CONFIG['jd_self_filter_enabled']:
+            logging.info(f"  京东自营校验: {self.jd_self_checks}/{self.jd_self_check_limit}")
+        else:
+            logging.info("  京东自营校验: 关闭")
         logging.info(f"  评论等级水军过滤: {self.stats['total_filtered_comment_level']}")
         logging.info(f"  评论等级不可用跳过: {self.stats['total_comment_level_unavailable']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
