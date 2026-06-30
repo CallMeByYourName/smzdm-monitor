@@ -544,13 +544,14 @@ class SmzdmScraper:
 
         if self.external_checks_suspended:
             return self._handle_jd_unverified(parsed, "外部校验已熔断")
-        if self.jd_self_checks >= CONFIG['max_jd_self_checks_per_run']:
-            return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
-        self.jd_self_checks += 1
 
         article_link = self._get_article_link(parsed)
         if not article_link:
             return self._handle_jd_unverified(parsed, "未找到 article_link")
+
+        if self.jd_self_checks >= CONFIG['max_jd_self_checks_per_run']:
+            return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
+        self.jd_self_checks += 1
 
         jd_url = self._resolve_smzdm_go_link(article_link, parsed.get('link'))
         if not jd_url:
