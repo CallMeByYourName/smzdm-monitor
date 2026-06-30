@@ -60,7 +60,7 @@ CONFIG = {
 
     # 第二阶段：京东自营校验（基于真实跳转链路解析京东商品页 isSelf 字段）
     "jd_self_filter_enabled": True,
-    "jd_link_lookup_pages": 6,           # 当前列表接口不带 article_link，按频道接口最多回查页数
+    "jd_link_lookup_pages": 12,          # 当前列表接口不带 article_link，按频道接口最多回查页数
     "jd_link_lookup_page_size": 50,
     "jd_reject_when_unverified": True,   # 京东商品无法确认自营时拒绝，避免放过非自营
     "jd_self_check_min_per_run": 5,       # 京东候选少时的基础校验量
@@ -613,7 +613,7 @@ class SmzdmScraper:
     def _handle_jd_unverified(self, parsed, reason):
         action = "过滤" if CONFIG['jd_reject_when_unverified'] else "放行"
         log_fn = logging.info if "达到本轮京东自营校验上限" in reason else logging.warning
-        log_fn(f"[京东自营无法确认，{action}] {parsed['title'][:40]}... | {reason}")
+        log_fn(f"[京东自营无法确认，{action}] #{parsed['id']} {parsed['title'][:40]}... | {reason}")
         return not CONFIG['jd_reject_when_unverified']
 
     def _fetch_jd_is_self_from_url(self, jd_url):
@@ -851,11 +851,13 @@ class SmzdmScraper:
 
     @staticmethod
     def _extract_jd_is_self(html_text):
-        if re.search(r'\bisSelf\s*:\s*true\b', html_text):
+        if re.search(r'''["']?\bisSelf\b["']?\s*:\s*true\b''', html_text):
             return True
-        if re.search(r'\bisSelf\s*:\s*false\b', html_text):
+        if re.search(r'''["']?\bisSelf\b["']?\s*:\s*false\b''', html_text):
             return False
-        if '京东自营' in html_text or '自营旗舰店' in html_text:
+        if ('京东自营' in html_text
+                or '自营旗舰店' in html_text
+                or re.search(r'''alt\s*=\s*["']自营["']''', html_text)):
             return True
         return None
 
