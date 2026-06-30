@@ -480,6 +480,13 @@ class SmzdmScraper:
             return self._handle_jd_unverified(parsed, f"京东商品页请求异常: {e}")
 
         is_self = self._extract_jd_is_self(html_text)
+        if is_self is None:
+            canonical_url = self._build_jd_canonical_url(jd_url)
+            if canonical_url and canonical_url != jd_url:
+                parsed['jd_url'] = canonical_url
+                is_self = self._fetch_jd_is_self_from_url(canonical_url)
+                jd_url = canonical_url
+
         if is_self is True:
             logging.info(f"[京东自营通过] {parsed['title'][:40]}... | {jd_url}")
             return True
@@ -490,8 +497,35 @@ class SmzdmScraper:
 
     def _handle_jd_unverified(self, parsed, reason):
         action = "过滤" if CONFIG['jd_reject_when_unverified'] else "放行"
-        logging.warning(f"[京东自营无法确认，{action}] {parsed['title'][:40]}... | {reason}")
+        log_fn = logging.info if "达到本轮京东自营校验上限" in reason else logging.warning
+        log_fn(f"[京东自营无法确认，{action}] {parsed['title'][:40]}... | {reason}")
         return not CONFIG['jd_reject_when_unverified']
+
+    def _fetch_jd_is_self_from_url(self, jd_url):
+        if self.external_checks_suspended:
+            return None
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                jd_url,
+                headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
+                timeout=CONFIG['timeout'],
+                allow_redirects=True
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("京东 canonical 商品页触发反爬/验证码")
+                return None
+            return self._extract_jd_is_self(response.text)
+        except Exception as e:
+            logging.warning(f"京东 canonical 商品页请求异常: {e}")
+            return None
+
+    @staticmethod
+    def _build_jd_canonical_url(jd_url):
+        match = re.search(r'item(?:\.m)?\.jd\.com/(?:product/)?(\d+)\.html', jd_url)
+        if not match:
+            return ''
+        return f"https://item.jd.com/{match.group(1)}.html"
 
     def _get_article_link(self, parsed):
         article_link = parsed.get('article_link')
