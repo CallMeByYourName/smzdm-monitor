@@ -46,9 +46,9 @@ CONFIG = {
     "discussion_min_total_engagement": 20,
     "discussion_min_composite_score": 70,
     "emerging_min_worthy": 4,            # 早期好价路径：低评论但值票/收藏快速增长
-    "emerging_min_comments": 2,
-    "emerging_min_total_engagement": 8,
-    "emerging_min_composite_score": 18,
+    "emerging_min_comments": 3,
+    "emerging_min_total_engagement": 12,
+    "emerging_min_composite_score": 25,
     "emerging_min_score_rate": 85,
     "excluded_title_keywords": [         # 非商品类、易重复推送的活动信息
         "支付立减券",
@@ -59,6 +59,18 @@ CONFIG = {
         "京豆",
         "入会",
         "关注领",
+    ],
+    "excluded_category_keywords": [      # 主列表 category/tag 可直接识别的虚拟/服务类内容
+        "金融服务",
+        "消费金融",
+        "支付",
+        "券/红包",
+        "运营商",
+    ],
+    "excluded_status_keywords": [
+        "售罄",
+        "过期",
+        "已结束",
     ],
 
     # 第二阶段：京东自营校验
@@ -88,7 +100,9 @@ CONFIG = {
     "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.6, # 单个用户评论占比过高则可疑
-    "max_comment_level_checks_per_run": 8,
+    "comment_level_check_min_per_run": 8,
+    "comment_level_check_candidate_ratio": 0.5,
+    "max_comment_level_checks_per_run": 30,
 
     # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
@@ -150,6 +164,7 @@ class SmzdmScraper:
         self.jd_fetch_debug = []
         self.jd_page_checks_unavailable = False
         self.comment_level_checks = 0
+        self.comment_level_check_limit = CONFIG['comment_level_check_min_per_run']
         self.external_checks_suspended = False
 
     def _init_session(self):
@@ -244,12 +259,14 @@ class SmzdmScraper:
         candidates = self._scan_and_filter_stage1()
         candidates = self._prioritize_candidates(candidates)
         self.jd_self_check_limit = self._calculate_jd_self_check_limit(candidates)
+        self.comment_level_check_limit = self._calculate_comment_level_check_limit(candidates)
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
         if CONFIG['jd_self_filter_enabled']:
             logging.info(f"京东自营动态校验预算: {self.jd_self_check_limit} 次")
         else:
             logging.info("京东自营过滤: 关闭，京东商品按通用水军策略判断")
+        logging.info(f"评论等级动态校验预算: {self.comment_level_check_limit} 次")
 
         # 第二轮：可选京东自营、评论等级、互动异常检测
         for parsed in candidates:
@@ -398,7 +415,57 @@ class SmzdmScraper:
             'age_hours': age_hours,
             'fingerprint': self._build_title_fingerprint(title),
             'price_value': self._parse_price_value(item.get('article_price', '')),
+            'category_text': self._extract_category_text(item),
+            'tag_text': self._extract_tag_text(item),
+            'is_sold_out': self._truthy_field(item.get('article_is_sold_out')),
+            'is_timeout': self._truthy_field(item.get('article_is_timeout')),
+            'status_text': ' '.join(
+                str(item.get(key, '')).strip()
+                for key in ('stock_status_name', 'article_status_name')
+                if str(item.get(key, '')).strip()
+            ),
         }
+
+    @staticmethod
+    def _truthy_field(value):
+        text = str(value or '').strip().lower()
+        return text not in ('', '0', 'false', 'none', 'null')
+
+    def _extract_category_text(self, item):
+        category = item.get('article_category') or item.get('tag_category') or ''
+        parts = []
+        if isinstance(category, str):
+            parts.append(category)
+        elif isinstance(category, list):
+            for node in category:
+                if isinstance(node, dict):
+                    parts.extend(
+                        str(node.get(key, '')).strip()
+                        for key in ('title', 'nicktitle', 'search_nicktitle', 'url_nicktitle')
+                        if str(node.get(key, '')).strip()
+                    )
+                else:
+                    parts.append(str(node))
+        elif isinstance(category, dict):
+            parts.extend(str(value).strip() for value in category.values() if str(value).strip())
+        return ' '.join(parts)
+
+    def _extract_tag_text(self, item):
+        tags = item.get('article_tag_arr') or item.get('article_tags') or []
+        parts = []
+        if isinstance(tags, str):
+            parts.append(tags)
+        elif isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, dict):
+                    parts.extend(
+                        str(tag.get(key, '')).strip()
+                        for key in ('tag_name', 'name', 'title')
+                        if str(tag.get(key, '')).strip()
+                    )
+                else:
+                    parts.append(str(tag))
+        return ' '.join(parts)
 
     def _extract_article_link(self, item):
         article_link = str(item.get('article_link') or '').strip()
@@ -481,7 +548,13 @@ class SmzdmScraper:
         unworthy = parsed['unworthy']
         weights = CONFIG['score_weights']
 
+        if self._is_inactive_deal(parsed):
+            return False
+
         if self._is_excluded_title(parsed['title']):
+            return False
+
+        if self._is_excluded_category_or_tag(parsed):
             return False
 
         if worthy < CONFIG['min_signal_worthy'] and comments < CONFIG['min_signal_comments']:
@@ -571,8 +644,39 @@ class SmzdmScraper:
 
         return min(jd_candidates, max_budget, max(min_budget, scaled_budget))
 
+    def _calculate_comment_level_check_limit(self, candidates):
+        if not CONFIG.get('comment_level_check_enabled'):
+            return 0
+
+        min_comments = int(CONFIG.get('comment_level_min_comments', 0))
+        checkable_candidates = sum(
+            1 for parsed in candidates
+            if parsed.get('comments', 0) >= min_comments
+        )
+        if checkable_candidates <= 0:
+            return 0
+
+        min_budget = max(0, int(CONFIG.get('comment_level_check_min_per_run', 0)))
+        max_budget = max(min_budget, int(CONFIG.get('max_comment_level_checks_per_run', min_budget)))
+        ratio = float(CONFIG.get('comment_level_check_candidate_ratio', 0))
+        scaled_budget = int(checkable_candidates * ratio)
+        if checkable_candidates * ratio > scaled_budget:
+            scaled_budget += 1
+
+        return min(checkable_candidates, max_budget, max(min_budget, scaled_budget))
+
     def _is_excluded_title(self, title):
         return any(keyword in title for keyword in CONFIG.get('excluded_title_keywords', []))
+
+    def _is_excluded_category_or_tag(self, parsed):
+        haystack = f"{parsed.get('category_text', '')} {parsed.get('tag_text', '')}"
+        return any(keyword in haystack for keyword in CONFIG.get('excluded_category_keywords', []))
+
+    def _is_inactive_deal(self, parsed):
+        if parsed.get('is_sold_out') or parsed.get('is_timeout'):
+            return True
+        status_text = parsed.get('status_text', '')
+        return any(keyword in status_text for keyword in CONFIG.get('excluded_status_keywords', []))
 
     def _check_jd_self_operated(self, parsed):
         """京东渠道只放行京东自营商品。
@@ -991,7 +1095,15 @@ class SmzdmScraper:
             self.stats['total_comment_level_unavailable'] += 1
             logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 外部校验已熔断")
             return True
-        if self.comment_level_checks >= CONFIG['max_comment_level_checks_per_run']:
+
+        if parsed.get('comments', 0) < CONFIG['comment_level_min_comments']:
+            logging.info(
+                f"[评论等级跳过] {parsed['title'][:40]}... | "
+                f"列表评论数 {parsed.get('comments', 0)} 不足 {CONFIG['comment_level_min_comments']}"
+            )
+            return True
+
+        if self.comment_level_checks >= self.comment_level_check_limit:
             self.stats['total_comment_level_unavailable'] += 1
             logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 达到本轮评论等级校验上限")
             return True
