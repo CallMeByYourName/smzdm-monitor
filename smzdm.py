@@ -210,6 +210,10 @@ class SmzdmScraper:
                 self.stats['total_filtered_shill'] += 1
                 continue
 
+            if self._is_fingerprint_duplicate(parsed):
+                self.stats['total_duplicates'] += 1
+                continue
+
             # 推送
             if self._send_notification(parsed):
                 self._save_history(parsed)
@@ -257,8 +261,6 @@ class SmzdmScraper:
 
                 candidates.append(parsed)
                 self.seen_ids.add(parsed['id'])  # 立即标记，防止跨页重复
-                if parsed.get('fingerprint'):
-                    self.seen_fingerprints.add(parsed['fingerprint'])
 
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
@@ -860,30 +862,7 @@ class SmzdmScraper:
 
     def _send_notification(self, data):
         """WXPusher 微信推送"""
-        score_rate = data.get('score_rate', 0)
-        composite_score = data.get('composite_score', 0)
-        quality_path = data.get('quality_path', '综合筛选')
-
-        # 评分等级标记
-        if composite_score >= 100:
-            score_tag = '🔥爆'
-        elif composite_score >= 60:
-            score_tag = '👍热'
-        else:
-            score_tag = '🆕新'
-
-        content = f"""
-        <b>{score_tag}【{data['mall']}】{data['title']}</b>
-        <br><br>
-        💰 价格：<span style='color:#e62828;font-weight:bold;'>{data['price']}</span><br>
-        🕒 发布：{data['pub_time']}<br>
-        💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
-        👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
-        📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
-        🧭 筛选：{quality_path}<br>
-        <br>
-        🔗 <a href='{data['link']}'>点击查看详情</a>
-        """
+        content = self._build_notification_content(data)
 
         try:
             response = requests.post(
@@ -911,6 +890,62 @@ class SmzdmScraper:
             logging.error(f"[推送异常] {e}")
             return False
 
+    def _build_notification_content(self, data):
+        """生成 WXPusher HTML 内容。"""
+        score_rate = data.get('score_rate', 0)
+        composite_score = data.get('composite_score', 0)
+        quality_path = data.get('quality_path', '综合筛选')
+        level_stats = data.get('comment_level_stats') or {}
+
+        if composite_score >= 100:
+            score_tag = '🔥爆'
+            score_label = '高热度'
+        elif composite_score >= 60:
+            score_tag = '👍热'
+            score_label = '值得看'
+        else:
+            score_tag = '🆕新'
+            score_label = '早期信号'
+
+        title = html.escape(str(data.get('title', '未知商品')), quote=True)
+        mall = html.escape(str(data.get('mall', '未知')), quote=True)
+        price = html.escape(str(data.get('price', '未知')), quote=True)
+        pub_time = html.escape(str(data.get('pub_time', '')), quote=True)
+        link = html.escape(str(data.get('link', '')), quote=True)
+        quality_path = html.escape(str(quality_path), quote=True)
+
+        level_line = ''
+        if level_stats:
+            low = level_stats.get('low', 0)
+            count = level_stats.get('count', 0)
+            high = level_stats.get('high', 0)
+            low_ratio = int(level_stats.get('low_ratio', 0) * 100)
+            level_line = (
+                f"👤 评论等级：Lv5及以下 {low}/{count}（{low_ratio}%）"
+                f" | Lv6及以上 {high}<br>"
+            )
+
+        return f"""
+        <div style="font-size:15px;line-height:1.65;">
+          <div style="font-size:17px;font-weight:bold;margin-bottom:8px;">
+            {score_tag}【{mall}】{title}
+          </div>
+          <div>
+            💰 <span style="color:#e62828;font-size:18px;font-weight:bold;">{price}</span>
+            <span style="color:#666;">（{score_label} / {quality_path}）</span>
+          </div>
+          <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
+          🕒 发布：{pub_time}<br>
+          📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
+          👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
+          💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
+          {level_line}
+          <div style="margin-top:10px;">
+            🔗 <a href="{link}">查看 SMZDM 详情</a>
+          </div>
+        </div>
+        """
+
     # ==================== 数据库 ====================
 
     def _is_duplicate(self, article_id):
@@ -918,13 +953,16 @@ class SmzdmScraper:
             parsed = article_id
             if parsed['id'] in self.seen_ids:
                 return True
-            fingerprint = parsed.get('fingerprint')
-            if fingerprint and fingerprint in self.seen_fingerprints:
-                self.stats['total_fingerprint_duplicates'] += 1
-                logging.info(f"[相似商品重复跳过] {parsed['title'][:40]}... | 指纹:{fingerprint}")
-                return True
-            return False
+            return self._is_fingerprint_duplicate(parsed)
         return article_id in self.seen_ids
+
+    def _is_fingerprint_duplicate(self, parsed):
+        fingerprint = parsed.get('fingerprint')
+        if fingerprint and fingerprint in self.seen_fingerprints:
+            self.stats['total_fingerprint_duplicates'] += 1
+            logging.info(f"[相似商品重复跳过] {parsed['title'][:40]}... | 指纹:{fingerprint}")
+            return True
+        return False
 
     def _save_history(self, data):
         try:
