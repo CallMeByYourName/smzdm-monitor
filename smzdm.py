@@ -69,6 +69,9 @@ CONFIG = {
     "comment_level_high_min": 6,         # Lv6 及以上视为真实用户倾向
     "comment_level_min_comments": 3,     # 可取到的评论数少于此值时不做等级判断
     "comment_level_max_low_ratio": 0.5,  # 低等级评论用户占比超过 50% 则过滤
+    "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
+    "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
+    "comment_concentration_max_user_ratio": 0.6, # 单个用户评论占比过高则可疑
     "max_comment_level_checks_per_run": 8,
 
     # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
@@ -796,25 +799,30 @@ class SmzdmScraper:
             return True
         self.comment_level_checks += 1
 
-        levels = self._fetch_comment_user_levels(parsed['id'])
-        if len(levels) < CONFIG['comment_level_min_comments']:
+        samples = self._fetch_comment_samples(parsed['id'])
+        levels = [sample['level'] for sample in samples if sample.get('level') is not None]
+        if len(samples) < CONFIG['comment_level_min_comments']:
             if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
                 self.stats['total_comment_level_unavailable'] += 1
                 logging.info(
                     f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
-                    f"API评论:{parsed['comments']} 可取等级:{len(levels)}"
+                    f"API评论:{parsed['comments']} 可取评论:{len(samples)}"
                 )
             return True
 
         low_count = sum(1 for level in levels if level <= CONFIG['comment_level_low_max'])
         high_count = sum(1 for level in levels if level >= CONFIG['comment_level_high_min'])
-        low_ratio = low_count / len(levels)
+        low_ratio = low_count / len(levels) if levels else 0
+        user_stats = self._calculate_comment_user_stats(samples)
 
         parsed['comment_level_stats'] = {
-            'count': len(levels),
+            'count': len(samples),
             'low': low_count,
             'high': high_count,
             'low_ratio': round(low_ratio, 2),
+            'unique_users': user_stats['unique_users'],
+            'max_user_comments': user_stats['max_user_comments'],
+            'max_user_ratio': round(user_stats['max_user_ratio'], 2),
         }
 
         if low_ratio > CONFIG['comment_level_max_low_ratio']:
@@ -825,14 +833,31 @@ class SmzdmScraper:
             )
             return False
 
+        if (len(samples) >= CONFIG['comment_concentration_min_comments']
+                and user_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
+            logging.warning(
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | "
+                f"独立用户:{user_stats['unique_users']}/{len(samples)}"
+            )
+            return False
+
+        if (len(samples) >= CONFIG['comment_concentration_min_comments']
+                and user_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
+            logging.warning(
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | "
+                f"最高单用户:{user_stats['max_user_comments']}/{len(samples)}={user_stats['max_user_ratio']:.0%}"
+            )
+            return False
+
         logging.info(
             f"[评论等级通过] {parsed['title'][:40]}... | "
             f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
-            f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
+            f"Lv>={CONFIG['comment_level_high_min']} {high_count} | "
+            f"独立用户:{user_stats['unique_users']}/{len(samples)}"
         )
         return True
 
-    def _fetch_comment_user_levels(self, article_id):
+    def _fetch_comment_samples(self, article_id):
         url = f'https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}'
         try:
             self._throttle_external_request()
@@ -855,22 +880,56 @@ class SmzdmScraper:
             logging.warning(f"评论等级接口请求失败 {article_id}: {e}")
             return []
 
-        levels = []
-        self._collect_comment_levels(resp_json, levels)
-        return levels
+        samples = []
+        self._collect_comment_samples(resp_json, samples)
+        return self._dedupe_comment_samples(samples)
 
-    def _collect_comment_levels(self, node, levels):
+    def _collect_comment_samples(self, node, samples):
         if isinstance(node, dict):
             if 'comment_id' in node and 'vip_level' in node and not node.get('display_author'):
+                user_id = str(node.get('user_smzdm_id') or node.get('display_name') or '').strip()
+                level = None
                 try:
-                    levels.append(int(node['vip_level']))
+                    level = int(node['vip_level'])
                 except (TypeError, ValueError):
                     pass
+                samples.append({
+                    'level': level,
+                    'user_id': user_id or f"comment:{node.get('comment_id')}",
+                    'comment_id': str(node.get('comment_id', '')),
+                })
             for value in node.values():
-                self._collect_comment_levels(value, levels)
+                self._collect_comment_samples(value, samples)
         elif isinstance(node, list):
             for value in node:
-                self._collect_comment_levels(value, levels)
+                self._collect_comment_samples(value, samples)
+
+    @staticmethod
+    def _calculate_comment_user_stats(samples):
+        counts = {}
+        for sample in samples:
+            user_id = sample.get('user_id') or sample.get('comment_id') or 'unknown'
+            counts[user_id] = counts.get(user_id, 0) + 1
+        max_count = max(counts.values()) if counts else 0
+        total = len(samples)
+        return {
+            'unique_users': len(counts),
+            'max_user_comments': max_count,
+            'max_user_ratio': max_count / total if total else 0,
+        }
+
+    @staticmethod
+    def _dedupe_comment_samples(samples):
+        deduped = []
+        seen_ids = set()
+        for sample in samples:
+            comment_id = sample.get('comment_id')
+            if comment_id:
+                if comment_id in seen_ids:
+                    continue
+                seen_ids.add(comment_id)
+            deduped.append(sample)
+        return deduped
 
     def _throttle_external_request(self):
         time.sleep(random.uniform(*CONFIG['external_request_delay']))
@@ -996,9 +1055,12 @@ class SmzdmScraper:
             count = level_stats.get('count', 0)
             high = level_stats.get('high', 0)
             low_ratio = int(level_stats.get('low_ratio', 0) * 100)
+            unique_users = level_stats.get('unique_users', 0)
+            max_user_comments = level_stats.get('max_user_comments', 0)
             level_line = (
                 f"👤 评论等级：Lv5及以下 {low}/{count}（{low_ratio}%）"
                 f" | Lv6及以上 {high}<br>"
+                f"👥 评论用户：独立 {unique_users}/{count} | 单人最多 {max_user_comments}<br>"
             )
         price_drop_line = ''
         if price_drop_note:
