@@ -216,6 +216,7 @@ class SmzdmScraper:
 
             # 推送
             if self._send_notification(parsed):
+                # 只有推送成功才写入历史；未达标或推送失败的商品下次运行会重新按最新互动数据评估。
                 self._save_history(parsed)
                 self.stats['total_sent'] += 1
 
@@ -953,6 +954,7 @@ class SmzdmScraper:
             parsed = article_id
             if parsed['id'] in self.seen_ids:
                 return True
+            # 只拦截历史中已成功推送过的相似商品；未推送商品不会写入指纹，后续扫描仍可复评。
             return self._is_fingerprint_duplicate(parsed)
         return article_id in self.seen_ids
 
