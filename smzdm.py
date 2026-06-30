@@ -56,6 +56,9 @@ CONFIG = {
         "红包",
         "话费券",
         "签到",
+        "京豆",
+        "入会",
+        "关注领",
     ],
 
     # 第二阶段：京东自营校验（基于真实跳转链路解析京东商品页 isSelf 字段）
@@ -583,7 +586,10 @@ class SmzdmScraper:
             self._throttle_external_request()
             response = self.session.get(
                 jd_url,
-                headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate',
+                },
                 timeout=CONFIG['timeout'],
                 allow_redirects=True
             )
@@ -601,6 +607,8 @@ class SmzdmScraper:
                 parsed['jd_url'] = canonical_url
                 is_self = self._fetch_jd_is_self_from_url(canonical_url)
                 jd_url = canonical_url
+        if is_self is None:
+            is_self = self._fetch_jd_is_self_from_mobile(jd_url)
 
         if is_self is True:
             logging.info(f"[京东自营通过] {parsed['title'][:40]}... | {jd_url}")
@@ -623,7 +631,10 @@ class SmzdmScraper:
             self._throttle_external_request()
             response = self.session.get(
                 jd_url,
-                headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'},
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate',
+                },
                 timeout=CONFIG['timeout'],
                 allow_redirects=True
             )
@@ -635,12 +646,50 @@ class SmzdmScraper:
             logging.warning(f"京东 canonical 商品页请求异常: {e}")
             return None
 
+    def _fetch_jd_is_self_from_mobile(self, jd_url):
+        mobile_url = self._build_jd_mobile_url(jd_url)
+        if not mobile_url or self.external_checks_suspended:
+            return None
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                mobile_url,
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Referer': jd_url,
+                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                                  'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+                },
+                timeout=CONFIG['timeout'],
+                allow_redirects=True
+            )
+            if self._is_waf_response(response):
+                self._suspend_external_checks("京东移动商品页触发反爬/验证码")
+                return None
+            return self._extract_jd_mobile_is_self(response.text)
+        except Exception as e:
+            logging.warning(f"京东移动商品页请求异常: {e}")
+            return None
+
     @staticmethod
     def _build_jd_canonical_url(jd_url):
-        match = re.search(r'item(?:\.m)?\.jd\.com/(?:product/)?(\d+)\.html', jd_url)
-        if not match:
+        sku_id = SmzdmScraper._extract_jd_sku_id(jd_url)
+        if not sku_id:
             return ''
-        return f"https://item.jd.com/{match.group(1)}.html"
+        return f"https://item.jd.com/{sku_id}.html"
+
+    @staticmethod
+    def _build_jd_mobile_url(jd_url):
+        sku_id = SmzdmScraper._extract_jd_sku_id(jd_url)
+        if not sku_id:
+            return ''
+        return f"https://item.m.jd.com/product/{sku_id}.html"
+
+    @staticmethod
+    def _extract_jd_sku_id(jd_url):
+        match = re.search(r'item(?:\.m)?\.jd\.com/(?:product/)?(\d+)\.html', jd_url)
+        return match.group(1) if match else ''
 
     def _get_article_link(self, parsed):
         article_link = parsed.get('article_link')
@@ -855,10 +904,27 @@ class SmzdmScraper:
             return True
         if re.search(r'''["']?\bisSelf\b["']?\s*:\s*false\b''', html_text):
             return False
-        if ('京东自营' in html_text
-                or '自营旗舰店' in html_text
-                or re.search(r'''alt\s*=\s*["']自营["']''', html_text)):
+        if (re.search(r'''(?:title|alt)\s*=\s*["'][^"']*自营[^"']*["']''', html_text)
+                or re.search(r'''["'](?:shopName|vender)["']\s*:\s*["'][^"']*自营[^"']*["']''', html_text)):
             return True
+        return None
+
+    @staticmethod
+    def _extract_jd_mobile_is_self(html_text):
+        if re.search(r'''["']?\bisSelf\b["']?\s*:\s*true\b''', html_text):
+            return True
+        if re.search(r'''["']?\bisSelf\b["']?\s*:\s*false\b''', html_text):
+            return False
+
+        shop_names = re.findall(r'''["'](?:shopName|vender)["']\s*:\s*["']([^"']+)["']''', html_text)
+        if any('自营' in name for name in shop_names):
+            return True
+        if re.search(r'''alt\s*=\s*["']自营["']''', html_text):
+            return True
+        if re.search(r'''["']po["']\s*:\s*false\b''', html_text) and '自营订单' in html_text:
+            return True
+        if shop_names and re.search(r'''["']po["']\s*:\s*true\b''', html_text):
+            return False
         return None
 
     def _check_comment_user_levels(self, parsed):
