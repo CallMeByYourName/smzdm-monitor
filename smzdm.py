@@ -63,7 +63,9 @@ CONFIG = {
     "jd_link_lookup_pages": 6,           # 当前列表接口不带 article_link，按频道接口最多回查页数
     "jd_link_lookup_page_size": 50,
     "jd_reject_when_unverified": True,   # 京东商品无法确认自营时拒绝，避免放过非自营
-    "max_jd_self_checks_per_run": 5,      # 控制 go.smzdm/jd 外部链路请求量
+    "jd_self_check_min_per_run": 5,       # 京东候选少时的基础校验量
+    "jd_self_check_candidate_ratio": 0.3, # 京东候选多时按比例增加校验量
+    "max_jd_self_checks_per_run": 12,     # 硬上限，控制 go.smzdm/jd 外部链路请求量
 
     # 第三阶段：评论用户等级水军检测（haojia.m.smzdm.com 真实 JSON 的 vip_level）
     "comment_level_check_enabled": True,
@@ -132,6 +134,7 @@ class SmzdmScraper:
         self.channel_link_pages_loaded = {}
         self.channel_link_exhausted = set()
         self.jd_self_checks = 0
+        self.jd_self_check_limit = CONFIG['jd_self_check_min_per_run']
         self.comment_level_checks = 0
         self.external_checks_suspended = False
 
@@ -226,8 +229,10 @@ class SmzdmScraper:
         # 第一轮：API 扫描 + 综合评分筛选，收集候选商品
         candidates = self._scan_and_filter_stage1()
         candidates = self._prioritize_candidates(candidates)
+        self.jd_self_check_limit = self._calculate_jd_self_check_limit(candidates)
 
         logging.info(f"综合评分筛选后候选商品: {len(candidates)} 条")
+        logging.info(f"京东自营动态校验预算: {self.jd_self_check_limit} 次")
 
         # 第二轮：京东自营、评论等级、互动异常检测
         for parsed in candidates:
@@ -530,6 +535,22 @@ class SmzdmScraper:
 
         return sorted(candidates, key=priority, reverse=True)
 
+    def _calculate_jd_self_check_limit(self, candidates):
+        jd_candidates = sum(1 for parsed in candidates if parsed.get('mall') == '京东')
+        if jd_candidates <= 0:
+            return 0
+
+        min_budget = max(0, int(CONFIG.get('jd_self_check_min_per_run', 0)))
+        max_budget = max(min_budget, int(CONFIG.get('max_jd_self_checks_per_run', min_budget)))
+        ratio = float(CONFIG.get('jd_self_check_candidate_ratio', 0))
+        ratio = min(max(ratio, 0), 1)
+
+        scaled_budget = int(jd_candidates * ratio)
+        if jd_candidates * ratio > scaled_budget:
+            scaled_budget += 1
+
+        return min(jd_candidates, max_budget, max(min_budget, scaled_budget))
+
     def _is_excluded_title(self, title):
         return any(keyword in title for keyword in CONFIG.get('excluded_title_keywords', []))
 
@@ -549,7 +570,7 @@ class SmzdmScraper:
         if not article_link:
             return self._handle_jd_unverified(parsed, "未找到 article_link")
 
-        if self.jd_self_checks >= CONFIG['max_jd_self_checks_per_run']:
+        if self.jd_self_checks >= self.jd_self_check_limit:
             return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
         self.jd_self_checks += 1
 
@@ -1225,6 +1246,7 @@ class SmzdmScraper:
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
         logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")
+        logging.info(f"  京东自营校验: {self.jd_self_checks}/{self.jd_self_check_limit}")
         logging.info(f"  评论等级水军过滤: {self.stats['total_filtered_comment_level']}")
         logging.info(f"  评论等级不可用跳过: {self.stats['total_comment_level_unavailable']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
