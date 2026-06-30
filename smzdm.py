@@ -69,6 +69,13 @@ CONFIG = {
     "jd_self_check_min_per_run": 5,       # 京东候选少时的基础校验量
     "jd_self_check_candidate_ratio": 0.3, # 京东候选多时按比例增加校验量
     "max_jd_self_checks_per_run": 12,     # 硬上限，控制 go.smzdm/jd 外部链路请求量
+    "jd_self_title_keywords": [           # 京东页面在云端不可用时，仅对确定的京东自营体系做兜底
+        "京东自营",
+        "自营旗舰店",
+        "1号会员店",
+        "京东京造",
+        "京东超市",
+    ],
 
     # 第三阶段：评论用户等级水军检测（haojia.m.smzdm.com 真实 JSON 的 vip_level）
     "comment_level_check_enabled": True,
@@ -139,6 +146,7 @@ class SmzdmScraper:
         self.jd_self_checks = 0
         self.jd_self_check_limit = CONFIG['jd_self_check_min_per_run']
         self.jd_fetch_debug = []
+        self.jd_page_checks_unavailable = False
         self.comment_level_checks = 0
         self.external_checks_suspended = False
 
@@ -570,9 +578,16 @@ class SmzdmScraper:
         if self.external_checks_suspended:
             return self._handle_jd_unverified(parsed, "外部校验已熔断")
 
+        if self._is_known_jd_self_from_title(parsed):
+            logging.info(f"[京东自营标题兜底通过] {parsed['title'][:40]}...")
+            return True
+
         article_link = self._get_article_link(parsed)
         if not article_link:
             return self._handle_jd_unverified(parsed, "未找到 article_link")
+
+        if self.jd_page_checks_unavailable:
+            return self._handle_jd_unverified(parsed, "京东商品页云端不可用")
 
         if self.jd_self_checks >= self.jd_self_check_limit:
             return self._handle_jd_unverified(parsed, "达到本轮京东自营校验上限")
@@ -619,12 +634,16 @@ class SmzdmScraper:
         if is_self is False:
             logging.warning(f"[京东非自营过滤] {parsed['title'][:40]}... | {jd_url}")
             return False
+        reason = "京东商品页未找到 isSelf"
         if self.jd_fetch_debug:
             logging.warning(
                 f"[京东判定诊断] #{parsed['id']} {parsed['title'][:30]}... | "
                 + " ; ".join(self.jd_fetch_debug)
             )
-        return self._handle_jd_unverified(parsed, "京东商品页未找到 isSelf")
+            if not self._jd_fetch_has_product_markers():
+                self.jd_page_checks_unavailable = True
+                reason = "京东商品页返回云端空壳页"
+        return self._handle_jd_unverified(parsed, reason)
 
     def _handle_jd_unverified(self, parsed, reason):
         action = "过滤" if CONFIG['jd_reject_when_unverified'] else "放行"
@@ -695,6 +714,13 @@ class SmzdmScraper:
             f"{label}:http={response.status_code},ce={response.headers.get('content-encoding') or '-'},"
             f"len={len(text)},markers={','.join(markers) or '-'},head={prefix or '-'}"
         )
+
+    def _jd_fetch_has_product_markers(self):
+        return any('markers=-' not in item for item in self.jd_fetch_debug)
+
+    def _is_known_jd_self_from_title(self, parsed):
+        title = parsed.get('title', '')
+        return any(keyword in title for keyword in CONFIG.get('jd_self_title_keywords', []))
 
     @staticmethod
     def _build_jd_canonical_url(jd_url):
