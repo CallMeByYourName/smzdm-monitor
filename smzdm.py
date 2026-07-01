@@ -101,8 +101,11 @@ CONFIG = {
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.6, # 单个用户评论占比过高则可疑
     "comment_level_check_min_per_run": 8,
-    "comment_level_check_candidate_ratio": 0.5,
+    "comment_level_check_candidate_ratio": 0.75,
     "max_comment_level_checks_per_run": 30,
+    "defer_emerging_when_comment_unavailable": True,
+    "pending_review_fallback_runs": 2,
+    "pending_review_keep_days": 2,
 
     # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
@@ -153,6 +156,12 @@ class SmzdmScraper:
             'total_filtered_comment_level': 0,
             'total_filtered_shill': 0,
             'total_comment_level_unavailable': 0,
+            'total_comment_level_unavailable_budget': 0,
+            'total_comment_level_unavailable_sample': 0,
+            'total_comment_level_unavailable_low_comments': 0,
+            'total_comment_level_unavailable_external': 0,
+            'total_comment_level_deferred': 0,
+            'total_comment_level_fallback_allowed': 0,
             'total_external_checks_suspended': 0,
         }
         self.article_link_cache = {}
@@ -195,6 +204,20 @@ class SmzdmScraper:
         ''')
         self._ensure_history_columns()
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_history_fingerprint ON history (fingerprint, last_seen)')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS pending_reviews (
+                review_key TEXT PRIMARY KEY,
+                article_id TEXT,
+                title TEXT,
+                fingerprint TEXT,
+                mall TEXT,
+                unavailable_count INTEGER DEFAULT 0,
+                first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_quality_path TEXT,
+                last_reason TEXT
+            )
+        ''')
         self.conn.commit()
 
     def _ensure_history_columns(self):
@@ -276,6 +299,12 @@ class SmzdmScraper:
 
             if CONFIG['comment_level_check_enabled'] and not self._check_comment_user_levels(parsed):
                 self.stats['total_filtered_comment_level'] += 1
+                self._clear_pending_review(parsed)
+                continue
+
+            if self._should_defer_for_comment_unavailable(parsed):
+                self._save_pending_review(parsed)
+                self.stats['total_comment_level_deferred'] += 1
                 continue
 
             if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
@@ -290,6 +319,7 @@ class SmzdmScraper:
             if self._send_notification(parsed):
                 # 只有推送成功才写入历史；未达标或推送失败的商品下次运行会重新按最新互动数据评估。
                 self._save_history(parsed)
+                self._clear_pending_review(parsed)
                 self.stats['total_sent'] += 1
 
         self._print_statistics()
@@ -606,16 +636,17 @@ class SmzdmScraper:
         return True
 
     def _prioritize_candidates(self, candidates):
-        """把有限的外部校验预算优先用在更可靠的候选上。"""
+        """把有限的评论校验预算优先用在早期/高风险候选上。"""
         path_rank = {
+            '早期好价': 4,
             '高讨论': 3,
             '均衡热度': 2,
-            '早期好价': 1,
         }
 
         def priority(parsed):
             return (
                 path_rank.get(parsed.get('quality_path'), 0),
+                parsed.get('comments', 0) >= CONFIG['comment_level_min_comments'],
                 parsed.get('composite_score', 0),
                 parsed.get('comments', 0),
                 parsed.get('score_rate', 0),
@@ -1092,11 +1123,12 @@ class SmzdmScraper:
     def _check_comment_user_levels(self, parsed):
         """根据评论 JSON 中的 vip_level 识别低等级账号占比。"""
         if self.external_checks_suspended:
-            self.stats['total_comment_level_unavailable'] += 1
+            self._mark_comment_level_unavailable(parsed, 'external')
             logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 外部校验已熔断")
             return True
 
         if parsed.get('comments', 0) < CONFIG['comment_level_min_comments']:
+            self._mark_comment_level_unavailable(parsed, 'low_comments')
             logging.info(
                 f"[评论等级跳过] {parsed['title'][:40]}... | "
                 f"列表评论数 {parsed.get('comments', 0)} 不足 {CONFIG['comment_level_min_comments']}"
@@ -1104,7 +1136,7 @@ class SmzdmScraper:
             return True
 
         if self.comment_level_checks >= self.comment_level_check_limit:
-            self.stats['total_comment_level_unavailable'] += 1
+            self._mark_comment_level_unavailable(parsed, 'budget')
             logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 达到本轮评论等级校验上限")
             return True
         self.comment_level_checks += 1
@@ -1113,7 +1145,7 @@ class SmzdmScraper:
         levels = [sample['level'] for sample in samples if sample.get('level') is not None]
         if len(samples) < CONFIG['comment_level_min_comments']:
             if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
-                self.stats['total_comment_level_unavailable'] += 1
+                self._mark_comment_level_unavailable(parsed, 'sample')
                 logging.info(
                     f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
                     f"API评论:{parsed['comments']} 可取评论:{len(samples)}"
@@ -1159,6 +1191,8 @@ class SmzdmScraper:
             )
             return False
 
+        parsed['comment_level_status'] = 'passed'
+        parsed.pop('comment_level_unavailable_reason', None)
         logging.info(
             f"[评论等级通过] {parsed['title'][:40]}... | "
             f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
@@ -1166,6 +1200,54 @@ class SmzdmScraper:
             f"独立用户:{user_stats['unique_users']}/{len(samples)}"
         )
         return True
+
+    def _mark_comment_level_unavailable(self, parsed, reason):
+        parsed['comment_level_status'] = 'unavailable'
+        parsed['comment_level_unavailable_reason'] = reason
+        self.stats['total_comment_level_unavailable'] += 1
+
+        stat_key = {
+            'budget': 'total_comment_level_unavailable_budget',
+            'sample': 'total_comment_level_unavailable_sample',
+            'low_comments': 'total_comment_level_unavailable_low_comments',
+            'external': 'total_comment_level_unavailable_external',
+        }.get(reason)
+        if stat_key:
+            self.stats[stat_key] += 1
+
+    def _should_defer_for_comment_unavailable(self, parsed):
+        if parsed.get('comment_level_status') != 'unavailable':
+            return False
+
+        pending = self._get_pending_review(parsed)
+        pending_count = pending['unavailable_count'] if pending else 0
+        quality_path = parsed.get('quality_path')
+        reason = parsed.get('comment_level_unavailable_reason', 'unknown')
+
+        if (quality_path in ('均衡热度', '高讨论')
+                and pending_count >= CONFIG['pending_review_fallback_runs']):
+            self.stats['total_comment_level_fallback_allowed'] += 1
+            logging.info(
+                f"[评论等级兜底放行] {parsed['title'][:40]}... | "
+                f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason}"
+            )
+            return False
+
+        if quality_path == '早期好价' and CONFIG.get('defer_emerging_when_comment_unavailable'):
+            logging.info(
+                f"[早期好价暂缓] {parsed['title'][:40]}... | "
+                f"评论等级未确认:{reason}，已暂缓 {pending_count} 轮"
+            )
+            return True
+
+        if pending_count > 0 and quality_path in ('均衡热度', '高讨论'):
+            logging.info(
+                f"[评论等级继续暂缓] {parsed['title'][:40]}... | "
+                f"已暂缓 {pending_count} 轮，当前路径:{quality_path}，原因:{reason}"
+            )
+            return True
+
+        return False
 
     def _fetch_comment_samples(self, article_id):
         url = f'https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}'
@@ -1438,6 +1520,80 @@ class SmzdmScraper:
             return True
         return False
 
+    def _pending_review_key(self, parsed):
+        return parsed.get('fingerprint') or f"id:{parsed.get('id')}"
+
+    def _get_pending_review(self, parsed):
+        review_key = self._pending_review_key(parsed)
+        if not review_key:
+            return None
+
+        cursor = self.conn.execute(
+            '''
+            SELECT unavailable_count, last_quality_path, last_reason
+            FROM pending_reviews
+            WHERE review_key = ?
+            ''',
+            (review_key,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            'unavailable_count': int(row[0] or 0),
+            'last_quality_path': row[1],
+            'last_reason': row[2],
+        }
+
+    def _save_pending_review(self, parsed):
+        review_key = self._pending_review_key(parsed)
+        if not review_key:
+            return
+
+        pending = self._get_pending_review(parsed)
+        unavailable_count = (pending['unavailable_count'] if pending else 0) + 1
+        reason = parsed.get('comment_level_unavailable_reason', 'unknown')
+        self.conn.execute(
+            '''
+            INSERT INTO pending_reviews (
+                review_key, article_id, title, fingerprint, mall,
+                unavailable_count, first_seen, last_seen, last_quality_path, last_reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?)
+            ON CONFLICT(review_key) DO UPDATE SET
+                article_id = excluded.article_id,
+                title = excluded.title,
+                fingerprint = excluded.fingerprint,
+                mall = excluded.mall,
+                unavailable_count = excluded.unavailable_count,
+                last_seen = CURRENT_TIMESTAMP,
+                last_quality_path = excluded.last_quality_path,
+                last_reason = excluded.last_reason
+            ''',
+            (
+                review_key,
+                parsed.get('id'),
+                parsed.get('title', '')[:100],
+                parsed.get('fingerprint', ''),
+                parsed.get('mall', ''),
+                unavailable_count,
+                parsed.get('quality_path', ''),
+                reason,
+            )
+        )
+        self.conn.commit()
+        logging.info(
+            f"[暂缓复评记录] {parsed['title'][:40]}... | "
+            f"key:{review_key[:40]} 次数:{unavailable_count} 原因:{reason}"
+        )
+
+    def _clear_pending_review(self, parsed):
+        review_key = self._pending_review_key(parsed)
+        if not review_key:
+            return
+        self.conn.execute("DELETE FROM pending_reviews WHERE review_key = ?", (review_key,))
+        self.conn.commit()
+
     def _save_history(self, data):
         try:
             self.conn.execute(
@@ -1470,9 +1626,16 @@ class SmzdmScraper:
         cutoff = datetime.now() - timedelta(days=30)
         cursor = self.conn.execute("DELETE FROM history WHERE last_seen < ?", (cutoff,))
         deleted = cursor.rowcount
+
+        pending_cutoff = datetime.now() - timedelta(days=CONFIG['pending_review_keep_days'])
+        pending_cursor = self.conn.execute("DELETE FROM pending_reviews WHERE last_seen < ?", (pending_cutoff,))
+        pending_deleted = pending_cursor.rowcount
+
         self.conn.commit()
         if deleted > 0:
             logging.info(f"清理 {deleted} 条过期记录")
+        if pending_deleted > 0:
+            logging.info(f"清理 {pending_deleted} 条过期待复评记录")
 
     # ==================== 辅助 ====================
 
@@ -1489,7 +1652,13 @@ class SmzdmScraper:
         else:
             logging.info("  京东自营校验: 关闭")
         logging.info(f"  评论等级水军过滤: {self.stats['total_filtered_comment_level']}")
-        logging.info(f"  评论等级不可用跳过: {self.stats['total_comment_level_unavailable']}")
+        logging.info(f"  评论等级不可用: {self.stats['total_comment_level_unavailable']}")
+        logging.info(f"    预算不足: {self.stats['total_comment_level_unavailable_budget']}")
+        logging.info(f"    样本不足: {self.stats['total_comment_level_unavailable_sample']}")
+        logging.info(f"    列表评论不足: {self.stats['total_comment_level_unavailable_low_comments']}")
+        logging.info(f"    外部熔断: {self.stats['total_comment_level_unavailable_external']}")
+        logging.info(f"  评论等级暂缓复评: {self.stats['total_comment_level_deferred']}")
+        logging.info(f"  评论等级兜底放行: {self.stats['total_comment_level_fallback_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
