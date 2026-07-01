@@ -101,11 +101,14 @@ CONFIG = {
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.6, # 单个用户评论占比过高则可疑
     "comment_level_check_min_per_run": 8,
-    "comment_level_check_candidate_ratio": 0.75,
-    "max_comment_level_checks_per_run": 30,
+    "comment_level_check_candidate_ratio": 0.9,
+    "max_comment_level_checks_per_run": 40,
     "defer_emerging_when_comment_unavailable": True,
     "pending_review_fallback_runs": 2,
     "pending_review_keep_days": 2,
+    "fallback_allowed_reasons": ["sample", "external"],
+    "budget_strong_pass_min_score": 120,
+    "budget_strong_pass_min_comments": 20,
 
     # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
@@ -162,6 +165,7 @@ class SmzdmScraper:
             'total_comment_level_unavailable_external': 0,
             'total_comment_level_deferred': 0,
             'total_comment_level_fallback_allowed': 0,
+            'total_comment_level_budget_strong_allowed': 0,
             'total_external_checks_suspended': 0,
         }
         self.article_link_cache = {}
@@ -303,7 +307,8 @@ class SmzdmScraper:
                 continue
 
             if self._should_defer_for_comment_unavailable(parsed):
-                self._save_pending_review(parsed)
+                if parsed.get('comment_level_unavailable_reason') != 'budget':
+                    self._save_pending_review(parsed)
                 self.stats['total_comment_level_deferred'] += 1
                 continue
 
@@ -1224,14 +1229,22 @@ class SmzdmScraper:
         quality_path = parsed.get('quality_path')
         reason = parsed.get('comment_level_unavailable_reason', 'unknown')
 
-        if (quality_path in ('均衡热度', '高讨论')
-                and pending_count >= CONFIG['pending_review_fallback_runs']):
-            self.stats['total_comment_level_fallback_allowed'] += 1
+        if (reason == 'budget'
+                and quality_path in ('均衡热度', '高讨论')
+                and self._is_strong_budget_pass(parsed)):
+            self.stats['total_comment_level_budget_strong_allowed'] += 1
             logging.info(
-                f"[评论等级兜底放行] {parsed['title'][:40]}... | "
-                f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason}"
+                f"[评论预算不足强信号放行] {parsed['title'][:40]}... | "
+                f"路径:{quality_path} 评分:{parsed.get('composite_score', 0)} 评论:{parsed.get('comments', 0)}"
             )
             return False
+
+        if reason == 'budget':
+            logging.info(
+                f"[评论预算不足暂缓] {parsed['title'][:40]}... | "
+                f"路径:{quality_path} 评分:{parsed.get('composite_score', 0)} 评论:{parsed.get('comments', 0)}"
+            )
+            return True
 
         if quality_path == '早期好价' and CONFIG.get('defer_emerging_when_comment_unavailable'):
             logging.info(
@@ -1240,7 +1253,17 @@ class SmzdmScraper:
             )
             return True
 
-        if pending_count > 0 and quality_path in ('均衡热度', '高讨论'):
+        if (quality_path in ('均衡热度', '高讨论')
+                and reason in CONFIG['fallback_allowed_reasons']
+                and pending_count >= CONFIG['pending_review_fallback_runs']):
+            self.stats['total_comment_level_fallback_allowed'] += 1
+            logging.info(
+                f"[评论等级兜底放行] {parsed['title'][:40]}... | "
+                f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason}"
+            )
+            return False
+
+        if quality_path in ('均衡热度', '高讨论'):
             logging.info(
                 f"[评论等级继续暂缓] {parsed['title'][:40]}... | "
                 f"已暂缓 {pending_count} 轮，当前路径:{quality_path}，原因:{reason}"
@@ -1248,6 +1271,12 @@ class SmzdmScraper:
             return True
 
         return False
+
+    def _is_strong_budget_pass(self, parsed):
+        return (
+            parsed.get('composite_score', 0) >= CONFIG['budget_strong_pass_min_score']
+            and parsed.get('comments', 0) >= CONFIG['budget_strong_pass_min_comments']
+        )
 
     def _fetch_comment_samples(self, article_id):
         url = f'https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}'
@@ -1659,6 +1688,7 @@ class SmzdmScraper:
         logging.info(f"    外部熔断: {self.stats['total_comment_level_unavailable_external']}")
         logging.info(f"  评论等级暂缓复评: {self.stats['total_comment_level_deferred']}")
         logging.info(f"  评论等级兜底放行: {self.stats['total_comment_level_fallback_allowed']}")
+        logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
