@@ -4,45 +4,97 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SMZDM (什么值得买 / "What's Worth Buying") deal scraper. Monitors SMZDM API for deals, applies three-stage filtering (composite scoring + user level shill detection + interaction anomaly detection), deduplicates via SQLite, and pushes to WeChat via WXPusher.
+SMZDM (什么值得买 / "What's Worth Buying") deal monitor. The project runs as a single Python script that scans SMZDM deal listings, filters candidates by engagement quality, checks comment user levels and comment concentration, deduplicates with SQLite, and pushes accepted deals to WeChat via WXPusher.
 
 ## Running
 
 ```bash
-# Local (set env vars, needs playwright chromium installed)
-pip install -r requirements.txt && playwright install --with-deps chromium
+pip install -r requirements.txt
 WXPUSHER_APP_TOKEN=xxx WXPUSHER_UID=xxx python3 smzdm.py
-
-# Deployed via GitHub Actions cron (every 10 min)
 ```
 
-Single-run mode: scan once -> filter -> push -> exit. No loop.
+Optional:
+
+- `SMZDM_DB_PATH` sets the SQLite database path. Default: `smzdm.db`.
+
+The script is single-run mode: scan once -> filter -> push -> exit. There is no local loop.
 
 ## Architecture
 
-**`smzdm.py`** — single-file script, class `SmzdmScraper`:
+**`smzdm.py`** is the main script and contains `SmzdmScraper`.
 
-- **Data source**: `https://api.smzdm.com/v1/list?limit=20&offset=N` — paginated deal listings, scans from page 1 with time-window stop (max 6 hours)
-- **Stage 1 filter**: Composite scoring — weighted engagement score (comments×3 + collection×2 + worthy×1 >= 40) + minimum total engagement + score rate >= 70%
-- **Stage 2 filter**: User level shill detection via Playwright — loads article page in headless Chromium, extracts comment user levels from `img[src*="/level/"]` URLs (e.g. `/level/8.png` = Lv8). If low-level users (< Lv6) exceed 50% of commenters, item is flagged as shill.
-- **Stage 3 filter**: Interaction anomaly detection (worthy/unworthy ratio, comment/worthy ratio). Requires multiple flags to trigger.
-- **Dedup**: SQLite (`smzdm.db`) + in-memory `seen_ids` set. 30-day auto-cleanup.
-- **Push**: WXPusher API, HTML format
+- **Data source**: `https://api.smzdm.com/v1/list?limit=20&offset=N`
+- **Channel filter**: only `faxian` and `youhui`.
+- **Time window**: max 6 hours.
+- **Stage 1 filter**: weighted engagement scoring: `comments * 3 + collection * 2 + worthy`.
+- **Stage 2 filter**: comment user level and comment concentration checks from `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`.
+- **Stage 3 fallback**: interaction anomaly detection using worthy/unworthy ratio and comment/worthy ratio.
+- **Dedup**: SQLite `history` table plus in-memory article IDs and title fingerprints.
+- **Pending review**: SQLite `pending_reviews` table for deals whose comment level data is unavailable and should be rechecked in later runs.
+- **Push**: WXPusher HTML message.
 
-## Configuration
+## Current Filtering Rules
 
-All in `CONFIG` dict at top of `smzdm.py`. Credentials via environment variables:
-- `WXPUSHER_APP_TOKEN` / `WXPUSHER_UID` — WXPusher credentials
-- `SMZDM_DB_PATH` — SQLite path (default: `smzdm.db`)
+Stage 1 has three acceptance paths:
 
-## Deployment (GitHub Actions)
+- `均衡热度`: total engagement >= 15, composite score >= 45, score rate >= 70%.
+- `高讨论`: comments >= 8, total engagement >= 20, composite score >= 70, score rate >= 55%.
+- `早期好价`: worthy >= 4, comments >= 3, total engagement >= 12, composite score >= 25, score rate >= 85%.
 
-`.github/workflows/smzdm.yml` — cron every 10 min. SQLite persisted via `actions/cache`. Secrets: `WXPUSHER_APP_TOKEN`, `WXPUSHER_UID`.
+Basic signal requirement:
+
+- worthy >= 2 or comments >= 2.
+- inactive deals are filtered if sold out, timed out, expired, or ended.
+
+There is currently no title keyword or category/tag hard exclusion. Carrier cards, coupons, red packets, finance, and similar content should be blocked downstream by WXPusher keyword rules if desired.
+
+## Comment-Level Logic
+
+Comment level checks use the SMZDM mobile JSON module, not Playwright.
+
+- Low level: Lv5 and below.
+- High level: Lv6 and above.
+- Filter when low-level comment ratio is greater than 50%.
+- When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 60% of samples.
+
+Unavailable comment data is not treated as an automatic pass:
+
+- The per-run comment check budget is dynamic: minimum 8, 90% of checkable candidates, maximum 40.
+- Emerging deals are deferred when comment levels are unavailable.
+- Balanced/high-discussion deals are deferred when data is unavailable, then may fallback after repeated unavailable observations for allowed reasons (`sample`, `external`).
+- Budget-unavailable deals are deferred unless they are strong signals: composite score >= 120 and comments >= 20.
+- Pending review records are kept for 2 days.
+
+## JD Handling
+
+JD self-operated hard filtering is disabled by default. GitHub Actions often cannot reliably read JD store/self-operated fields from external pages, so JD deals are handled by the same generic comment-level, concentration, interaction anomaly, and dedup rules as other platforms.
+
+The old JD self-check helpers remain in the code behind `jd_self_filter_enabled`, but the default config is `False`.
+
+## Dedup and Re-Push Rules
+
+- Only successfully pushed deals are saved to `history`.
+- Same article ID is skipped after being saved.
+- Similar title fingerprints are deduped for 3 days.
+- Same fingerprint can be pushed again if the new price is at least 5 RMB lower or at least 5% lower than the previous pushed minimum.
+- Deferred, filtered, or failed-push deals are not written to `history`, so later scans can reevaluate them with newer data.
+
+## Deployment
+
+`.github/workflows/smzdm.yml`:
+
+- Runs every 30 minutes via GitHub schedule.
+- Supports manual `workflow_dispatch`.
+- Supports `repository_dispatch` for external cron-job.org triggers.
+- Persists `smzdm.db` with `actions/cache`.
+- Uses `concurrency: smzdm-scan`.
+
+Note: `actions/cache` is not a fully reliable mutable database store. Closely spaced runs can restore an older cache and may produce duplicate pushes. A state branch, artifact, external KV, or external database would be more robust.
 
 ## Key Technical Notes
 
-- SMZDM article pages have WAF protection (returns 202 with JS challenge) — `requests` cannot bypass it, but Playwright with headless Chromium can. Used for Stage 2 user level detection.
-- Playwright browser is lazily initialized — only starts when a candidate passes Stage 1 and needs level checking. Reuses the same browser instance across all candidates.
-- User levels are encoded in image URLs on the page: `https://res.smzdm.com/h5/h5_user/dist/assets/level/{N}.png`
-- `tongji_hudong` field: comma-separated string (`评论_5,收藏_3,值_10,不值_2`) parsed for precise interaction data, with fallback to top-level API fields.
-- Comment API (`article-api.smzdm.com`) exists but requires request signing — not feasible without reverse-engineering the mobile app's HMAC. Playwright approach is more reliable.
+- Dependency list is intentionally minimal: `requests`.
+- `tongji_hudong` is parsed for precise interaction data (`评论_5,收藏_3,值_10,不值_2`) with top-level field fallback.
+- External comment/detail requests are throttled with random delays.
+- WAF-like responses (`202`, `403`, `429`, captcha markers, `probe.js`, access-frequency text) suspend external checks for the rest of the current run.
+- Notification content includes score tag, price, score rate, engagement numbers, comment level stats when available, price-drop notes, and the SMZDM detail link.
