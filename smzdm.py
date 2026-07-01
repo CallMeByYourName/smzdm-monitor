@@ -50,23 +50,6 @@ CONFIG = {
     "emerging_min_total_engagement": 12,
     "emerging_min_composite_score": 25,
     "emerging_min_score_rate": 85,
-    "excluded_title_keywords": [         # 非商品类、易重复推送的活动信息
-        "支付立减券",
-        "无门槛券",
-        "红包",
-        "话费券",
-        "签到",
-        "京豆",
-        "入会",
-        "关注领",
-    ],
-    "excluded_category_keywords": [      # 主列表 category/tag 可直接识别的虚拟/服务类内容
-        "金融服务",
-        "消费金融",
-        "支付",
-        "券/红包",
-        "运营商",
-    ],
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -450,8 +433,6 @@ class SmzdmScraper:
             'age_hours': age_hours,
             'fingerprint': self._build_title_fingerprint(title),
             'price_value': self._parse_price_value(item.get('article_price', '')),
-            'category_text': self._extract_category_text(item),
-            'tag_text': self._extract_tag_text(item),
             'is_sold_out': self._truthy_field(item.get('article_is_sold_out')),
             'is_timeout': self._truthy_field(item.get('article_is_timeout')),
             'status_text': ' '.join(
@@ -465,42 +446,6 @@ class SmzdmScraper:
     def _truthy_field(value):
         text = str(value or '').strip().lower()
         return text not in ('', '0', 'false', 'none', 'null')
-
-    def _extract_category_text(self, item):
-        category = item.get('article_category') or item.get('tag_category') or ''
-        parts = []
-        if isinstance(category, str):
-            parts.append(category)
-        elif isinstance(category, list):
-            for node in category:
-                if isinstance(node, dict):
-                    parts.extend(
-                        str(node.get(key, '')).strip()
-                        for key in ('title', 'nicktitle', 'search_nicktitle', 'url_nicktitle')
-                        if str(node.get(key, '')).strip()
-                    )
-                else:
-                    parts.append(str(node))
-        elif isinstance(category, dict):
-            parts.extend(str(value).strip() for value in category.values() if str(value).strip())
-        return ' '.join(parts)
-
-    def _extract_tag_text(self, item):
-        tags = item.get('article_tag_arr') or item.get('article_tags') or []
-        parts = []
-        if isinstance(tags, str):
-            parts.append(tags)
-        elif isinstance(tags, list):
-            for tag in tags:
-                if isinstance(tag, dict):
-                    parts.extend(
-                        str(tag.get(key, '')).strip()
-                        for key in ('tag_name', 'name', 'title')
-                        if str(tag.get(key, '')).strip()
-                    )
-                else:
-                    parts.append(str(tag))
-        return ' '.join(parts)
 
     def _extract_article_link(self, item):
         article_link = str(item.get('article_link') or '').strip()
@@ -584,12 +529,6 @@ class SmzdmScraper:
         weights = CONFIG['score_weights']
 
         if self._is_inactive_deal(parsed):
-            return False
-
-        if self._is_excluded_title(parsed['title']):
-            return False
-
-        if self._is_excluded_category_or_tag(parsed):
             return False
 
         if worthy < CONFIG['min_signal_worthy'] and comments < CONFIG['min_signal_comments']:
@@ -700,13 +639,6 @@ class SmzdmScraper:
             scaled_budget += 1
 
         return min(checkable_candidates, max_budget, max(min_budget, scaled_budget))
-
-    def _is_excluded_title(self, title):
-        return any(keyword in title for keyword in CONFIG.get('excluded_title_keywords', []))
-
-    def _is_excluded_category_or_tag(self, parsed):
-        haystack = f"{parsed.get('category_text', '')} {parsed.get('tag_text', '')}"
-        return any(keyword in haystack for keyword in CONFIG.get('excluded_category_keywords', []))
 
     def _is_inactive_deal(self, parsed):
         if parsed.get('is_sold_out') or parsed.get('is_timeout'):
