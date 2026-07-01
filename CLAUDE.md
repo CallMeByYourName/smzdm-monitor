@@ -38,8 +38,8 @@ The script is single-run mode: scan once -> filter -> push -> exit. There is no 
 Stage 1 has three acceptance paths:
 
 - `均衡热度`: total engagement >= 15, composite score >= 45, score rate >= 70%.
-- `高讨论`: comments >= 8, total engagement >= 20, composite score >= 70, score rate >= 55%.
-- `早期好价`: worthy >= 4, comments >= 3, total engagement >= 12, composite score >= 25, score rate >= 85%.
+- `高讨论`: comments >= 8, total engagement >= 20, composite score >= 70, score rate >= 70%.
+- `早期好价`: worthy >= 4, comments >= 3, total engagement >= 12, composite score >= 25, score rate >= 90%.
 
 Basic signal requirement:
 
@@ -54,8 +54,8 @@ Comment level checks use the SMZDM mobile JSON module, not Playwright.
 
 - Low level: Lv5 and below.
 - High level: Lv6 and above.
-- Filter when low-level comment ratio is greater than 50%.
-- When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 60% of samples.
+- Filter when low-level comment ratio is greater than 35%.
+- When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
 
 Unavailable comment data is not treated as an automatic pass:
 

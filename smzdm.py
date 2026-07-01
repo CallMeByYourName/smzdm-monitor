@@ -39,17 +39,17 @@ CONFIG = {
     "min_total_engagement": 15,         # 基础门槛：评论+收藏+值 >= 15
     "min_composite_score": 45,          # 综合评分阈值 (略微调高防止低质推送)
     "min_score_rate": 70,               # 均衡路径好评率
-    "min_score_rate_relaxed": 55,        # 高讨论路径的最低好评率，避免错过有争议但真实的好价
+    "min_score_rate_relaxed": 70,        # 高讨论路径也要求较高好评率，避免推送争议商品
     "min_signal_worthy": 2,              # 至少有值票或评论信号，避免纯收藏/纯券活动
     "min_signal_comments": 2,
-    "discussion_min_comments": 8,        # 高讨论路径：评论多、互动强时允许较低好评率
+    "discussion_min_comments": 8,        # 高讨论路径：评论多、互动强，但仍要求较高好评率
     "discussion_min_total_engagement": 20,
     "discussion_min_composite_score": 70,
     "emerging_min_worthy": 4,            # 早期好价路径：低评论但值票/收藏快速增长
     "emerging_min_comments": 3,
     "emerging_min_total_engagement": 12,
     "emerging_min_composite_score": 25,
-    "emerging_min_score_rate": 85,
+    "emerging_min_score_rate": 90,
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -79,10 +79,10 @@ CONFIG = {
     "comment_level_low_max": 5,          # Lv5 及以下视为低等级/新号
     "comment_level_high_min": 6,         # Lv6 及以上视为真实用户倾向
     "comment_level_min_comments": 3,     # 可取到的评论数少于此值时不做等级判断
-    "comment_level_max_low_ratio": 0.5,  # 低等级评论用户占比超过 50% 则过滤
+    "comment_level_max_low_ratio": 0.35, # 低等级评论用户占比超过 35% 则过滤
     "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
-    "comment_concentration_max_user_ratio": 0.6, # 单个用户评论占比过高则可疑
+    "comment_concentration_max_user_ratio": 0.5, # 单个用户评论占比过高则可疑
     "comment_level_check_min_per_run": 8,
     "comment_level_check_candidate_ratio": 0.9,
     "max_comment_level_checks_per_run": 40,
@@ -96,8 +96,8 @@ CONFIG = {
     # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
     "shill_detection_enabled": True,
     "shill_min_votes_for_check": 30,        # 总投票数少于此值时跳过水军检测
-    "shill_max_worthy_unworthy_ratio": 30,  # 值/不值比超过此值则可疑指标+1
-    "shill_min_comment_worthy_ratio": 0.15, # 评论数/值票数低于此值则可疑指标+1
+    "shill_max_worthy_unworthy_ratio": 20,  # 值/不值比超过此值则可疑指标+1
+    "shill_min_comment_worthy_ratio": 0.2,  # 评论数/值票数低于此值则可疑指标+1
     "shill_min_flags": 2,                   # 至少N个可疑指标才标记为水军
 
     # 去重参数
