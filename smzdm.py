@@ -83,6 +83,7 @@ CONFIG = {
     "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.5, # 单个用户评论占比过高则可疑
+    "large_thread_representative_min_samples": 5, # 大评论区热评样本少时不把样本当完整代表
     "comment_level_check_min_per_run": 8,
     "comment_level_check_candidate_ratio": 0.9,
     "max_comment_level_checks_per_run": 40,
@@ -1147,6 +1148,36 @@ class SmzdmScraper:
                 )
             return True
 
+        if self._is_large_thread_under_sampled(samples, comment_meta):
+            if self._is_large_thread_partial_pass(parsed, samples, level_stats, comment_meta):
+                self.stats['total_comment_level_large_thread_allowed'] += 1
+                parsed['comment_level_status'] = 'passed'
+                parsed['comment_level_note'] = (
+                    f"大评论区少样本通过（模块评论{comment_meta.get('module_total', 0)}）"
+                )
+                parsed.pop('comment_level_unavailable_reason', None)
+                logging.info(
+                    f"[评论大区少样本通过] {parsed['title'][:40]}... | "
+                    f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
+                    f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
+                    f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
+                    f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
+                    f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
+                    f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                )
+                return True
+
+            self._mark_comment_level_unavailable(parsed, 'sample')
+            logging.info(
+                f"[评论大区样本不足，跳过] {parsed['title'][:40]}... | "
+                f"API评论:{parsed['comments']} 模块评论:{comment_meta.get('module_total', 0)} "
+                f"原始样本:{comment_meta.get('all_count', 0)} 作者:{comment_meta.get('author_count', 0)} "
+                f"非作者:{len(samples)} Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
+                f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} "
+                f"独立用户:{level_stats['unique_users']}/{len(samples)}"
+            )
+            return True
+
         low_count = level_stats['low']
         high_count = level_stats['high']
         low_ratio = level_stats['low_ratio']
@@ -1245,6 +1276,12 @@ class SmzdmScraper:
         return (
             parsed.get('comments', 0) >= CONFIG['large_thread_min_comments']
             and parsed.get('composite_score', 0) >= CONFIG['large_thread_min_score']
+        )
+
+    def _is_large_thread_under_sampled(self, samples, comment_meta):
+        return (
+            comment_meta.get('module_total', 0) >= CONFIG['large_thread_min_total']
+            and len(samples) < CONFIG['large_thread_representative_min_samples']
         )
 
     def _mark_comment_level_unavailable(self, parsed, reason):

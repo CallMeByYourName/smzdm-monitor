@@ -58,6 +58,7 @@ Comment level checks use the SMZDM mobile JSON module, not Playwright. This modu
 - When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
 - Mature balanced/high-discussion deals may pass with only 2 samples when both are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
 - Mature balanced/high-discussion deals may also pass as a large-thread partial sample when the module total is >= 50, score rate >= 95%, comments >= 15, composite score >= 50, non-author samples >= 2, low samples <= 1, and at least one sample is Lv6+.
+- Large threads with fewer than 5 non-author samples are not considered representative enough for direct low-level filtering; if they do not pass the large-thread rule, they are deferred as sample-unavailable instead.
 - Emerging deals do not use the partial-sample pass.
 
 Unavailable comment data is not treated as an automatic pass:
