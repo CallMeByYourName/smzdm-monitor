@@ -56,12 +56,14 @@ Comment level checks use the SMZDM mobile JSON module, not Playwright.
 - High level: Lv6 and above.
 - Filter when low-level comment ratio is greater than 35%.
 - When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
+- Mature balanced/high-discussion deals may pass with only 2 samples when both are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
+- Emerging deals do not use the partial-sample pass.
 
 Unavailable comment data is not treated as an automatic pass:
 
 - The per-run comment check budget is dynamic: minimum 8, 90% of checkable candidates, maximum 40.
 - Emerging deals are deferred when comment levels are unavailable.
-- Balanced/high-discussion deals are deferred when data is unavailable, then may fallback after repeated unavailable observations for allowed reasons (`sample`, `external`).
+- Balanced/high-discussion deals are deferred when data is unavailable, then may fallback after repeated unavailable observations for allowed reasons (`sample`, `external`) only if score rate >= 85%, comments >= 15, and composite score >= 90.
 - Budget-unavailable deals are deferred unless they are strong signals: composite score >= 120 and comments >= 20.
 - Pending review records are kept for 2 days.
 

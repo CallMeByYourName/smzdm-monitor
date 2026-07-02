@@ -90,6 +90,14 @@ CONFIG = {
     "pending_review_fallback_runs": 2,
     "pending_review_keep_days": 2,
     "fallback_allowed_reasons": ["sample", "external"],
+    "partial_sample_min_samples": 2,     # 少样本放行：至少取到 2 条评论
+    "partial_sample_min_unique_users": 2,
+    "partial_sample_min_score_rate": 85,
+    "partial_sample_min_comments": 10,
+    "partial_sample_min_score": 80,
+    "fallback_min_score_rate": 85,       # 样本长期不可用兜底：只放行成熟高信号商品
+    "fallback_min_comments": 15,
+    "fallback_min_score": 90,
     "budget_strong_pass_min_score": 120,
     "budget_strong_pass_min_comments": 20,
 
@@ -1079,52 +1087,60 @@ class SmzdmScraper:
         self.comment_level_checks += 1
 
         samples = self._fetch_comment_samples(parsed['id'])
-        levels = [sample['level'] for sample in samples if sample.get('level') is not None]
+        level_stats = self._build_comment_level_stats(samples)
+        if samples:
+            parsed['comment_level_stats'] = level_stats
+
         if len(samples) < CONFIG['comment_level_min_comments']:
             if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
+                if self._is_partial_sample_pass(parsed, samples, level_stats):
+                    parsed['comment_level_status'] = 'passed'
+                    parsed.pop('comment_level_unavailable_reason', None)
+                    logging.info(
+                        f"[评论等级少样本通过] {parsed['title'][:40]}... | "
+                        f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)}="
+                        f"{level_stats['low_ratio']:.0%}, "
+                        f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
+                        f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
+                        f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                    )
+                    return True
+
                 self._mark_comment_level_unavailable(parsed, 'sample')
                 logging.info(
                     f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
-                    f"API评论:{parsed['comments']} 可取评论:{len(samples)}"
+                    f"API评论:{parsed['comments']} 可取评论:{len(samples)} "
+                    f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
+                    f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} "
+                    f"独立用户:{level_stats['unique_users']}/{len(samples)}"
                 )
             return True
 
-        low_count = sum(1 for level in levels if level <= CONFIG['comment_level_low_max'])
-        high_count = sum(1 for level in levels if level >= CONFIG['comment_level_high_min'])
-        low_ratio = low_count / len(levels) if levels else 0
-        user_stats = self._calculate_comment_user_stats(samples)
-
-        parsed['comment_level_stats'] = {
-            'count': len(samples),
-            'low': low_count,
-            'high': high_count,
-            'low_ratio': round(low_ratio, 2),
-            'unique_users': user_stats['unique_users'],
-            'max_user_comments': user_stats['max_user_comments'],
-            'max_user_ratio': round(user_stats['max_user_ratio'], 2),
-        }
+        low_count = level_stats['low']
+        high_count = level_stats['high']
+        low_ratio = level_stats['low_ratio']
 
         if low_ratio > CONFIG['comment_level_max_low_ratio']:
             logging.warning(
                 f"[评论等级水军过滤] {parsed['title'][:40]}... | "
-                f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
+                f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
                 f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
             )
             return False
 
         if (len(samples) >= CONFIG['comment_concentration_min_comments']
-                and user_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
+                and level_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
             logging.warning(
                 f"[评论集中水军过滤] {parsed['title'][:40]}... | "
-                f"独立用户:{user_stats['unique_users']}/{len(samples)}"
+                f"独立用户:{level_stats['unique_users']}/{len(samples)}"
             )
             return False
 
         if (len(samples) >= CONFIG['comment_concentration_min_comments']
-                and user_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
+                and level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
             logging.warning(
                 f"[评论集中水军过滤] {parsed['title'][:40]}... | "
-                f"最高单用户:{user_stats['max_user_comments']}/{len(samples)}={user_stats['max_user_ratio']:.0%}"
+                f"最高单用户:{level_stats['max_user_comments']}/{len(samples)}={level_stats['max_user_ratio']:.0%}"
             )
             return False
 
@@ -1132,11 +1148,48 @@ class SmzdmScraper:
         parsed.pop('comment_level_unavailable_reason', None)
         logging.info(
             f"[评论等级通过] {parsed['title'][:40]}... | "
-            f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{len(levels)}={low_ratio:.0%}, "
+            f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
             f"Lv>={CONFIG['comment_level_high_min']} {high_count} | "
-            f"独立用户:{user_stats['unique_users']}/{len(samples)}"
+            f"独立用户:{level_stats['unique_users']}/{len(samples)}"
         )
         return True
+
+    def _build_comment_level_stats(self, samples):
+        levels = [sample['level'] for sample in samples if sample.get('level') is not None]
+        low_count = sum(1 for level in levels if level <= CONFIG['comment_level_low_max'])
+        high_count = sum(1 for level in levels if level >= CONFIG['comment_level_high_min'])
+        low_ratio = low_count / len(levels) if levels else 0
+        user_stats = self._calculate_comment_user_stats(samples)
+        return {
+            'count': len(samples),
+            'level_count': len(levels),
+            'low': low_count,
+            'high': high_count,
+            'low_ratio': low_ratio,
+            'unique_users': user_stats['unique_users'],
+            'max_user_comments': user_stats['max_user_comments'],
+            'max_user_ratio': user_stats['max_user_ratio'],
+        }
+
+    def _is_partial_sample_pass(self, parsed, samples, level_stats):
+        if parsed.get('quality_path') == '早期好价':
+            return False
+        if len(samples) < CONFIG['partial_sample_min_samples']:
+            return False
+        if level_stats['level_count'] < len(samples):
+            return False
+        if level_stats['high'] < len(samples) or level_stats['low'] > 0:
+            return False
+        if level_stats['unique_users'] < CONFIG['partial_sample_min_unique_users']:
+            return False
+        if level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']:
+            return False
+        if parsed.get('score_rate', 0) < CONFIG['partial_sample_min_score_rate']:
+            return False
+        return (
+            parsed.get('comments', 0) >= CONFIG['partial_sample_min_comments']
+            or parsed.get('composite_score', 0) >= CONFIG['partial_sample_min_score']
+        )
 
     def _mark_comment_level_unavailable(self, parsed, reason):
         parsed['comment_level_status'] = 'unavailable'
@@ -1187,11 +1240,14 @@ class SmzdmScraper:
 
         if (quality_path in ('均衡热度', '高讨论')
                 and reason in CONFIG['fallback_allowed_reasons']
-                and pending_count >= CONFIG['pending_review_fallback_runs']):
+                and pending_count >= CONFIG['pending_review_fallback_runs']
+                and self._is_comment_fallback_quality_pass(parsed)):
             self.stats['total_comment_level_fallback_allowed'] += 1
             logging.info(
                 f"[评论等级兜底放行] {parsed['title'][:40]}... | "
-                f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason}"
+                f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason} "
+                f"评分:{parsed.get('composite_score', 0)} 评论:{parsed.get('comments', 0)} "
+                f"好评率:{parsed.get('score_rate', 0)}%"
             )
             return False
 
@@ -1208,6 +1264,13 @@ class SmzdmScraper:
         return (
             parsed.get('composite_score', 0) >= CONFIG['budget_strong_pass_min_score']
             and parsed.get('comments', 0) >= CONFIG['budget_strong_pass_min_comments']
+        )
+
+    def _is_comment_fallback_quality_pass(self, parsed):
+        return (
+            parsed.get('score_rate', 0) >= CONFIG['fallback_min_score_rate']
+            and parsed.get('comments', 0) >= CONFIG['fallback_min_comments']
+            and parsed.get('composite_score', 0) >= CONFIG['fallback_min_score']
         )
 
     def _fetch_comment_samples(self, article_id):
