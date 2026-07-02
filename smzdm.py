@@ -95,6 +95,14 @@ CONFIG = {
     "partial_sample_min_score_rate": 85,
     "partial_sample_min_comments": 10,
     "partial_sample_min_score": 80,
+    "large_thread_min_total": 50,        # 模块声明评论很多但热评样本偏少时的受限放行
+    "large_thread_min_samples": 2,
+    "large_thread_min_unique_users": 2,
+    "large_thread_min_score_rate": 95,
+    "large_thread_min_comments": 15,
+    "large_thread_min_score": 50,
+    "large_thread_max_low_samples": 1,
+    "large_thread_min_high_samples": 1,
     "fallback_min_score_rate": 85,       # 样本长期不可用兜底：只放行成熟高信号商品
     "fallback_min_comments": 15,
     "fallback_min_score": 90,
@@ -156,6 +164,7 @@ class SmzdmScraper:
             'total_comment_level_unavailable_external': 0,
             'total_comment_level_deferred': 0,
             'total_comment_level_fallback_allowed': 0,
+            'total_comment_level_large_thread_allowed': 0,
             'total_comment_level_budget_strong_allowed': 0,
             'total_external_checks_suspended': 0,
         }
@@ -1086,15 +1095,35 @@ class SmzdmScraper:
             return True
         self.comment_level_checks += 1
 
-        samples = self._fetch_comment_samples(parsed['id'])
+        samples, comment_meta = self._fetch_comment_samples(parsed['id'])
+        parsed['comment_module_stats'] = comment_meta
         level_stats = self._build_comment_level_stats(samples)
         if samples:
             parsed['comment_level_stats'] = level_stats
 
         if len(samples) < CONFIG['comment_level_min_comments']:
             if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
+                if self._is_large_thread_partial_pass(parsed, samples, level_stats, comment_meta):
+                    self.stats['total_comment_level_large_thread_allowed'] += 1
+                    parsed['comment_level_status'] = 'passed'
+                    parsed['comment_level_note'] = (
+                        f"大评论区少样本通过（模块评论{comment_meta.get('module_total', 0)}）"
+                    )
+                    parsed.pop('comment_level_unavailable_reason', None)
+                    logging.info(
+                        f"[评论大区少样本通过] {parsed['title'][:40]}... | "
+                        f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
+                        f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
+                        f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
+                        f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
+                        f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
+                        f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                    )
+                    return True
+
                 if self._is_partial_sample_pass(parsed, samples, level_stats):
                     parsed['comment_level_status'] = 'passed'
+                    parsed['comment_level_note'] = '少样本通过'
                     parsed.pop('comment_level_unavailable_reason', None)
                     logging.info(
                         f"[评论等级少样本通过] {parsed['title'][:40]}... | "
@@ -1110,6 +1139,8 @@ class SmzdmScraper:
                 logging.info(
                     f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
                     f"API评论:{parsed['comments']} 可取评论:{len(samples)} "
+                    f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
+                    f"作者:{comment_meta.get('author_count', 0)} "
                     f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
                     f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} "
                     f"独立用户:{level_stats['unique_users']}/{len(samples)}"
@@ -1145,6 +1176,7 @@ class SmzdmScraper:
             return False
 
         parsed['comment_level_status'] = 'passed'
+        parsed.pop('comment_level_note', None)
         parsed.pop('comment_level_unavailable_reason', None)
         logging.info(
             f"[评论等级通过] {parsed['title'][:40]}... | "
@@ -1189,6 +1221,30 @@ class SmzdmScraper:
         return (
             parsed.get('comments', 0) >= CONFIG['partial_sample_min_comments']
             or parsed.get('composite_score', 0) >= CONFIG['partial_sample_min_score']
+        )
+
+    def _is_large_thread_partial_pass(self, parsed, samples, level_stats, comment_meta):
+        if parsed.get('quality_path') == '早期好价':
+            return False
+        if comment_meta.get('module_total', 0) < CONFIG['large_thread_min_total']:
+            return False
+        if len(samples) < CONFIG['large_thread_min_samples']:
+            return False
+        if level_stats['level_count'] < len(samples):
+            return False
+        if level_stats['unique_users'] < CONFIG['large_thread_min_unique_users']:
+            return False
+        if level_stats['low'] > CONFIG['large_thread_max_low_samples']:
+            return False
+        if level_stats['high'] < CONFIG['large_thread_min_high_samples']:
+            return False
+        if level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']:
+            return False
+        if parsed.get('score_rate', 0) < CONFIG['large_thread_min_score_rate']:
+            return False
+        return (
+            parsed.get('comments', 0) >= CONFIG['large_thread_min_comments']
+            and parsed.get('composite_score', 0) >= CONFIG['large_thread_min_score']
         )
 
     def _mark_comment_level_unavailable(self, parsed, reason):
@@ -1274,6 +1330,13 @@ class SmzdmScraper:
         )
 
     def _fetch_comment_samples(self, article_id):
+        empty_meta = {
+            'module_total': 0,
+            'module_rows': 0,
+            'all_count': 0,
+            'author_count': 0,
+            'non_author_count': 0,
+        }
         url = f'https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}'
         try:
             self._throttle_external_request()
@@ -1287,22 +1350,25 @@ class SmzdmScraper:
             )
             if self._is_waf_response(response):
                 self._suspend_external_checks("评论等级接口触发反爬/验证码")
-                return []
+                return [], empty_meta
             if response.status_code != 200:
                 logging.warning(f"评论等级接口 HTTP {response.status_code}: {article_id}")
-                return []
+                return [], empty_meta
             resp_json = response.json()
         except Exception as e:
             logging.warning(f"评论等级接口请求失败 {article_id}: {e}")
-            return []
+            return [], empty_meta
 
-        samples = []
-        self._collect_comment_samples(resp_json, samples)
-        return self._dedupe_comment_samples(samples)
+        all_samples = []
+        self._collect_comment_samples(resp_json, all_samples, include_author=True)
+        all_samples = self._dedupe_comment_samples(all_samples)
+        samples = [sample for sample in all_samples if not sample.get('display_author')]
+        meta = self._extract_comment_module_meta(resp_json, all_samples, samples)
+        return samples, meta
 
-    def _collect_comment_samples(self, node, samples):
+    def _collect_comment_samples(self, node, samples, include_author=False):
         if isinstance(node, dict):
-            if 'comment_id' in node and 'vip_level' in node and not node.get('display_author'):
+            if 'comment_id' in node and 'vip_level' in node and (include_author or not node.get('display_author')):
                 user_id = str(node.get('user_smzdm_id') or node.get('display_name') or '').strip()
                 level = None
                 try:
@@ -1313,12 +1379,35 @@ class SmzdmScraper:
                     'level': level,
                     'user_id': user_id or f"comment:{node.get('comment_id')}",
                     'comment_id': str(node.get('comment_id', '')),
+                    'display_author': bool(node.get('display_author')),
                 })
             for value in node.values():
-                self._collect_comment_samples(value, samples)
+                self._collect_comment_samples(value, samples, include_author=include_author)
         elif isinstance(node, list):
             for value in node:
-                self._collect_comment_samples(value, samples)
+                self._collect_comment_samples(value, samples, include_author=include_author)
+
+    @staticmethod
+    def _extract_comment_module_meta(resp_json, all_samples, samples):
+        hot_comments = {}
+        if isinstance(resp_json, dict):
+            hot_comments = (
+                resp_json.get('data', {})
+                .get('comments', {})
+                .get('hot_comments_b', {})
+            )
+        rows = hot_comments.get('rows') if isinstance(hot_comments, dict) else []
+        try:
+            module_total = int(hot_comments.get('total') or 0)
+        except (TypeError, ValueError):
+            module_total = 0
+        return {
+            'module_total': module_total,
+            'module_rows': len(rows) if isinstance(rows, list) else 0,
+            'all_count': len(all_samples),
+            'author_count': sum(1 for sample in all_samples if sample.get('display_author')),
+            'non_author_count': len(samples),
+        }
 
     @staticmethod
     def _calculate_comment_user_stats(samples):
@@ -1446,6 +1535,7 @@ class SmzdmScraper:
         composite_score = data.get('composite_score', 0)
         quality_path = data.get('quality_path', '综合筛选')
         level_stats = data.get('comment_level_stats') or {}
+        comment_level_note = data.get('comment_level_note')
         price_drop_note = data.get('price_drop_note')
 
         if composite_score >= 100:
@@ -1478,6 +1568,9 @@ class SmzdmScraper:
                 f" | Lv6及以上 {high}<br>"
                 f"👥 评论用户：独立 {unique_users}/{count} | 单人最多 {max_user_comments}<br>"
             )
+        note_line = ''
+        if comment_level_note:
+            note_line = f"🧪 评论判断：{html.escape(str(comment_level_note), quote=True)}<br>"
         price_drop_line = ''
         if price_drop_note:
             price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
@@ -1498,6 +1591,7 @@ class SmzdmScraper:
           👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
           💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
           {level_line}
+          {note_line}
           <div style="margin-top:10px;">
             🔗 <a href="{link}">查看 SMZDM 详情</a>
           </div>
@@ -1683,6 +1777,7 @@ class SmzdmScraper:
         logging.info(f"    外部熔断: {self.stats['total_comment_level_unavailable_external']}")
         logging.info(f"  评论等级暂缓复评: {self.stats['total_comment_level_deferred']}")
         logging.info(f"  评论等级兜底放行: {self.stats['total_comment_level_fallback_allowed']}")
+        logging.info(f"  评论大区少样本放行: {self.stats['total_comment_level_large_thread_allowed']}")
         logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")

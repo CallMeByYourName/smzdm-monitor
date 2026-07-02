@@ -50,13 +50,14 @@ There is currently no title keyword or category/tag hard exclusion. Carrier card
 
 ## Comment-Level Logic
 
-Comment level checks use the SMZDM mobile JSON module, not Playwright.
+Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis.
 
 - Low level: Lv5 and below.
 - High level: Lv6 and above.
 - Filter when low-level comment ratio is greater than 35%.
 - When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
 - Mature balanced/high-discussion deals may pass with only 2 samples when both are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
+- Mature balanced/high-discussion deals may also pass as a large-thread partial sample when the module total is >= 50, score rate >= 95%, comments >= 15, composite score >= 50, non-author samples >= 2, low samples <= 1, and at least one sample is Lv6+.
 - Emerging deals do not use the partial-sample pass.
 
 Unavailable comment data is not treated as an automatic pass:
