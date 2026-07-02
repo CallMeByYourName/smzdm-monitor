@@ -85,8 +85,8 @@ CONFIG = {
     "comment_concentration_max_user_ratio": 0.5, # 单个用户评论占比过高则可疑
     "large_thread_representative_min_samples": 5, # 大评论区热评样本少时不把样本当完整代表
     "comment_level_check_min_per_run": 8,
-    "comment_level_check_candidate_ratio": 0.9,
-    "max_comment_level_checks_per_run": 40,
+    "comment_level_check_candidate_ratio": 1.0, # 常规情况下校验全部可校验候选，避免预算导致半小时级延迟
+    "max_comment_level_checks_per_run": 80,     # 保留硬上限，避免候选异常暴增时连续撞外部接口
     "defer_emerging_when_comment_unavailable": True,
     "pending_review_fallback_runs": 2,
     "pending_review_keep_days": 2,

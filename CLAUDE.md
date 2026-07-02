@@ -63,7 +63,7 @@ Comment level checks use the SMZDM mobile JSON module, not Playwright. This modu
 
 Unavailable comment data is not treated as an automatic pass:
 
-- The per-run comment check budget is dynamic: minimum 8, 90% of checkable candidates, maximum 40.
+- The per-run comment check budget is dynamic: check all normally checkable candidates, capped at 80 to avoid excessive external requests during candidate spikes.
 - Emerging deals are deferred when comment levels are unavailable.
 - Balanced/high-discussion deals are deferred when data is unavailable, then may fallback after repeated unavailable observations for allowed reasons (`sample`, `external`) only if score rate >= 85%, comments >= 15, and composite score >= 90.
 - Budget-unavailable deals are deferred unless they are strong signals: composite score >= 120 and comments >= 20.
