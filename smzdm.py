@@ -1107,17 +1107,18 @@ class SmzdmScraper:
         parsed['comment_module_coverage'] = coverage
 
         if not coverage['representative']:
-            if parsed.get('comments', 0) >= CONFIG['comment_module_undercovered_skip_min_comments']:
+            if coverage['expected'] >= CONFIG['comment_module_undercovered_skip_min_comments']:
                 self.stats['total_comment_level_undercovered_skipped'] += 1
                 parsed['comment_level_status'] = 'skipped'
                 parsed['comment_level_note'] = (
-                    f"评论模块仅返回{coverage['returned']}/{coverage['listed']}，跳过等级判断"
+                    f"评论模块仅返回{coverage['returned']}/{coverage['expected']}，跳过等级判断"
                 )
                 parsed.pop('comment_level_stats', None)
                 parsed.pop('comment_level_unavailable_reason', None)
                 logging.info(
                     f"[评论模块覆盖不足，跳过等级判断] {parsed['title'][:40]}... | "
-                    f"API评论:{coverage['listed']} 返回评论:{coverage['returned']} "
+                    f"列表评论:{coverage['list_count']} 模块声明:{coverage['module_total']} "
+                    f"返回评论:{coverage['returned']} "
                     f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
                     f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
                     f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
@@ -1128,7 +1129,8 @@ class SmzdmScraper:
             parsed.pop('comment_level_stats', None)
             logging.info(
                 f"[评论模块覆盖不足，暂缓] {parsed['title'][:40]}... | "
-                f"API评论:{coverage['listed']} 返回评论:{coverage['returned']} "
+                f"列表评论:{coverage['list_count']} 模块声明:{coverage['module_total']} "
+                f"返回评论:{coverage['returned']} "
                 f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
                 f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)}"
             )
@@ -1271,22 +1273,27 @@ class SmzdmScraper:
 
     @staticmethod
     def _build_comment_module_coverage(parsed, comment_meta):
-        listed_comments = max(0, int(parsed.get('comments', 0) or 0))
+        list_comments = max(0, int(parsed.get('comments', 0) or 0))
+        module_total = max(0, int(comment_meta.get('module_total', 0) or 0))
+        expected_comments = max(list_comments, module_total)
         returned_comments = max(0, int(comment_meta.get('all_count', 0) or 0))
-        ratio = returned_comments / listed_comments if listed_comments else 0
+        ratio = returned_comments / expected_comments if expected_comments else 0
         tolerance = int(CONFIG.get('comment_module_coverage_tolerance', 0))
         min_ratio = float(CONFIG.get('comment_module_min_coverage_ratio', 1))
         representative = (
-            listed_comments > 0
+            expected_comments > 0
             and returned_comments > 0
             and (
-                returned_comments >= listed_comments
-                or listed_comments - returned_comments <= tolerance
+                returned_comments >= expected_comments
+                or expected_comments - returned_comments <= tolerance
                 or ratio >= min_ratio
             )
         )
         return {
-            'listed': listed_comments,
+            'listed': expected_comments,
+            'expected': expected_comments,
+            'list_count': list_comments,
+            'module_total': module_total,
             'returned': returned_comments,
             'ratio': ratio,
             'representative': representative,

@@ -52,7 +52,7 @@ There is currently no title keyword or category/tag hard exclusion. Carrier card
 
 Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis.
 
-Before applying level/concentration rules, the scraper checks module coverage by comparing raw returned comment nodes with the list API comment count. Samples are considered representative only when they cover about 80% of the listed comments or differ by at most 2 comments. If the list already has at least 10 comments but the module only returns a small hot-comment subset, comment-level shill judgment is skipped instead of filtering or deferring on those few samples.
+Before applying level/concentration rules, the scraper checks module coverage by comparing raw returned comment nodes with `max(list API comment count, module-declared total comments)`. Samples are considered representative only when they cover about 80% of that total or differ by at most 2 comments. If the total already has at least 10 comments but the module only returns a small hot-comment subset, comment-level shill judgment is skipped instead of filtering or deferring on those few samples.
 
 - Low level: Lv5 and below.
 - High level: Lv6 and above.
