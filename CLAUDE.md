@@ -52,13 +52,14 @@ There is currently no title keyword or category/tag hard exclusion. Carrier card
 
 Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis.
 
+Before applying level/concentration rules, the scraper checks module coverage by comparing raw returned comment nodes with the list API comment count. Samples are considered representative only when they cover about 80% of the listed comments or differ by at most 2 comments. If the list already has at least 10 comments but the module only returns a small hot-comment subset, comment-level shill judgment is skipped instead of filtering or deferring on those few samples.
+
 - Low level: Lv5 and below.
 - High level: Lv6 and above.
 - Filter when low-level comment ratio is greater than 35%.
 - When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
-- Mature balanced/high-discussion deals may pass with only 2 samples when both are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
-- Mature balanced/high-discussion deals may also pass as a large-thread partial sample when the module total is >= 50, score rate >= 95%, comments >= 15, composite score >= 50, non-author samples >= 2, low samples <= 1, and at least one sample is Lv6+.
-- Large threads with fewer than 5 non-author samples are not considered representative enough for direct low-level filtering; if they do not pass the large-thread rule, they are deferred as sample-unavailable instead.
+- Mature balanced/high-discussion deals may pass with only 2 non-author samples only after the module is representative, when both samples are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
+- If module coverage is insufficient and the list has fewer than 10 comments, the deal is deferred as sample-unavailable instead of judging from hot-comment samples.
 - Emerging deals do not use the partial-sample pass.
 
 Unavailable comment data is not treated as an automatic pass:

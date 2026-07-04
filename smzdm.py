@@ -83,6 +83,9 @@ CONFIG = {
     "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.5, # 单个用户评论占比过高则可疑
+    "comment_module_min_coverage_ratio": 0.8, # 评论模块返回样本覆盖列表评论数约 80% 才代表整体评论区
+    "comment_module_coverage_tolerance": 2,   # 或返回评论数与列表评论数差距不超过 2 条
+    "comment_module_undercovered_skip_min_comments": 10, # 总评论已较多但模块只给热评时跳过等级判断
     "large_thread_representative_min_samples": 5, # 大评论区热评样本少时不把样本当完整代表
     "comment_level_check_min_per_run": 8,
     "comment_level_check_candidate_ratio": 1.0, # 常规情况下校验全部可校验候选，避免预算导致半小时级延迟
@@ -166,6 +169,7 @@ class SmzdmScraper:
             'total_comment_level_deferred': 0,
             'total_comment_level_fallback_allowed': 0,
             'total_comment_level_large_thread_allowed': 0,
+            'total_comment_level_undercovered_skipped': 0,
             'total_comment_level_budget_strong_allowed': 0,
             'total_external_checks_suspended': 0,
         }
@@ -1099,6 +1103,37 @@ class SmzdmScraper:
         samples, comment_meta = self._fetch_comment_samples(parsed['id'])
         parsed['comment_module_stats'] = comment_meta
         level_stats = self._build_comment_level_stats(samples)
+        coverage = self._build_comment_module_coverage(parsed, comment_meta)
+        parsed['comment_module_coverage'] = coverage
+
+        if not coverage['representative']:
+            if parsed.get('comments', 0) >= CONFIG['comment_module_undercovered_skip_min_comments']:
+                self.stats['total_comment_level_undercovered_skipped'] += 1
+                parsed['comment_level_status'] = 'skipped'
+                parsed['comment_level_note'] = (
+                    f"评论模块仅返回{coverage['returned']}/{coverage['listed']}，跳过等级判断"
+                )
+                parsed.pop('comment_level_stats', None)
+                parsed.pop('comment_level_unavailable_reason', None)
+                logging.info(
+                    f"[评论模块覆盖不足，跳过等级判断] {parsed['title'][:40]}... | "
+                    f"API评论:{coverage['listed']} 返回评论:{coverage['returned']} "
+                    f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
+                    f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
+                    f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                )
+                return True
+
+            self._mark_comment_level_unavailable(parsed, 'sample')
+            parsed.pop('comment_level_stats', None)
+            logging.info(
+                f"[评论模块覆盖不足，暂缓] {parsed['title'][:40]}... | "
+                f"API评论:{coverage['listed']} 返回评论:{coverage['returned']} "
+                f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
+                f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)}"
+            )
+            return True
+
         if samples:
             parsed['comment_level_stats'] = level_stats
 
@@ -1232,6 +1267,29 @@ class SmzdmScraper:
             'unique_users': user_stats['unique_users'],
             'max_user_comments': user_stats['max_user_comments'],
             'max_user_ratio': user_stats['max_user_ratio'],
+        }
+
+    @staticmethod
+    def _build_comment_module_coverage(parsed, comment_meta):
+        listed_comments = max(0, int(parsed.get('comments', 0) or 0))
+        returned_comments = max(0, int(comment_meta.get('all_count', 0) or 0))
+        ratio = returned_comments / listed_comments if listed_comments else 0
+        tolerance = int(CONFIG.get('comment_module_coverage_tolerance', 0))
+        min_ratio = float(CONFIG.get('comment_module_min_coverage_ratio', 1))
+        representative = (
+            listed_comments > 0
+            and returned_comments > 0
+            and (
+                returned_comments >= listed_comments
+                or listed_comments - returned_comments <= tolerance
+                or ratio >= min_ratio
+            )
+        )
+        return {
+            'listed': listed_comments,
+            'returned': returned_comments,
+            'ratio': ratio,
+            'representative': representative,
         }
 
     def _is_partial_sample_pass(self, parsed, samples, level_stats):
@@ -1815,6 +1873,7 @@ class SmzdmScraper:
         logging.info(f"  评论等级暂缓复评: {self.stats['total_comment_level_deferred']}")
         logging.info(f"  评论等级兜底放行: {self.stats['total_comment_level_fallback_allowed']}")
         logging.info(f"  评论大区少样本放行: {self.stats['total_comment_level_large_thread_allowed']}")
+        logging.info(f"  评论模块覆盖不足跳过: {self.stats['total_comment_level_undercovered_skipped']}")
         logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
