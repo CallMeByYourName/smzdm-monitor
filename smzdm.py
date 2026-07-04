@@ -50,6 +50,11 @@ CONFIG = {
     "emerging_min_total_engagement": 12,
     "emerging_min_composite_score": 25,
     "emerging_min_score_rate": 90,
+    "early_signal_min_worthy": 4,        # 评论审核延迟时，允许低评论但收藏/值票同步增长的早期强信号
+    "early_signal_min_collection": 5,
+    "early_signal_min_total_engagement": 10,
+    "early_signal_min_composite_score": 22,
+    "early_signal_min_score_rate": 95,
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -149,7 +154,9 @@ class SmzdmScraper:
         self._init_database()
         self.seen_ids = set()
         self.seen_fingerprints = set()
+        self.seen_product_keys = set()
         self.fingerprint_min_prices = {}
+        self.product_key_min_prices = {}
         self._load_existing_ids()
 
         self.stats = {
@@ -157,6 +164,9 @@ class SmzdmScraper:
             'total_sent': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
+            'total_product_key_duplicates': 0,
+            'total_channel_metadata_enriched': 0,
+            'total_comment_count_upgraded': 0,
             'total_filtered_stage1': 0,
             'total_filtered_jd_self': 0,
             'total_filtered_comment_level': 0,
@@ -175,6 +185,8 @@ class SmzdmScraper:
         }
         self.article_link_cache = {}
         self.channel_article_link_cache = {}
+        self.channel_article_data_cache = {}
+        self.article_data_cache = {}
         self.channel_link_pages_loaded = {}
         self.channel_link_exhausted = set()
         self.jd_self_checks = 0
@@ -205,6 +217,7 @@ class SmzdmScraper:
                 id TEXT PRIMARY KEY,
                 title TEXT,
                 fingerprint TEXT,
+                product_key TEXT,
                 mall TEXT,
                 price TEXT,
                 price_value REAL,
@@ -213,6 +226,7 @@ class SmzdmScraper:
         ''')
         self._ensure_history_columns()
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_history_fingerprint ON history (fingerprint, last_seen)')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_history_product_key ON history (product_key, last_seen)')
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS pending_reviews (
                 review_key TEXT PRIMARY KEY,
@@ -234,6 +248,7 @@ class SmzdmScraper:
         existing_columns = {row[1] for row in cursor.fetchall()}
         required_columns = {
             'fingerprint': 'TEXT',
+            'product_key': 'TEXT',
             'mall': 'TEXT',
             'price': 'TEXT',
             'price_value': 'REAL',
@@ -274,7 +289,25 @@ class SmzdmScraper:
             self.seen_fingerprints.add(fingerprint)
             if min_price is not None:
                 self.fingerprint_min_prices[fingerprint] = float(min_price)
-        logging.info(f"已加载 {len(self.seen_ids)} 条历史记录，{len(self.seen_fingerprints)} 个近期商品指纹")
+
+        cursor = self.conn.execute(
+            '''
+            SELECT product_key, MIN(price_value)
+            FROM history
+            WHERE product_key IS NOT NULL AND product_key != '' AND last_seen >= ?
+            GROUP BY product_key
+            ''',
+            (cutoff,)
+        )
+        for product_key, min_price in cursor.fetchall():
+            self.seen_product_keys.add(product_key)
+            if min_price is not None:
+                self.product_key_min_prices[product_key] = float(min_price)
+        logging.info(
+            f"已加载 {len(self.seen_ids)} 条历史记录，"
+            f"{len(self.seen_fingerprints)} 个近期商品指纹，"
+            f"{len(self.seen_product_keys)} 个近期商品 SKU"
+        )
 
     # ==================== 扫描 ====================
 
@@ -289,6 +322,7 @@ class SmzdmScraper:
 
         # 第一轮：API 扫描 + 综合评分筛选，收集候选商品
         candidates = self._scan_and_filter_stage1()
+        self._enrich_candidates_from_channel_apis(candidates)
         candidates = self._prioritize_candidates(candidates)
         self.jd_self_check_limit = self._calculate_jd_self_check_limit(candidates)
         self.comment_level_check_limit = self._calculate_comment_level_check_limit(candidates)
@@ -321,7 +355,7 @@ class SmzdmScraper:
                 self.stats['total_filtered_shill'] += 1
                 continue
 
-            if self._is_fingerprint_duplicate(parsed):
+            if self._is_send_duplicate(parsed):
                 self.stats['total_duplicates'] += 1
                 continue
 
@@ -438,6 +472,7 @@ class SmzdmScraper:
         # 解析 tongji_hudong 获取精确数据
         tongji = self._parse_tongji_hudong(item.get('tongji_hudong', ''))
         article_link = self._extract_article_link(item)
+        mall_no, product_no = self._extract_mall_client(item)
 
         return {
             'id': article_id,
@@ -447,6 +482,9 @@ class SmzdmScraper:
             'article_link': article_link,
             'channel_type': channel_type,
             'mall': str(item.get('article_mall', '未知')).strip(),
+            'mall_no': mall_no,
+            'product_no': product_no,
+            'product_key': '',
             'pub_time': str(item.get('article_format_date', '')).strip(),
             'comments': tongji['comments'] or comments,
             'collection': tongji['collection'],
@@ -463,6 +501,21 @@ class SmzdmScraper:
                 if str(item.get(key, '')).strip()
             ),
         }
+
+    @staticmethod
+    def _extract_mall_client(item):
+        mall_client = item.get('article_mall_client') or {}
+        if isinstance(mall_client, str):
+            try:
+                mall_client = json.loads(mall_client)
+            except json.JSONDecodeError:
+                mall_client = {}
+        if not isinstance(mall_client, dict):
+            return '', ''
+        return (
+            str(mall_client.get('mall_no') or '').strip(),
+            str(mall_client.get('product_no') or '').strip(),
+        )
 
     @staticmethod
     def _truthy_field(value):
@@ -586,6 +639,12 @@ class SmzdmScraper:
               and composite_score >= CONFIG['emerging_min_composite_score']
               and score_rate >= CONFIG['emerging_min_score_rate']):
             quality_path = '早期好价'
+        elif (worthy >= CONFIG['early_signal_min_worthy']
+              and collection >= CONFIG['early_signal_min_collection']
+              and total_engagement >= CONFIG['early_signal_min_total_engagement']
+              and composite_score >= CONFIG['early_signal_min_composite_score']
+              and score_rate >= CONFIG['early_signal_min_score_rate']):
+            quality_path = '早期强信号'
 
         if not quality_path:
             return False
@@ -601,10 +660,43 @@ class SmzdmScraper:
         )
         return True
 
+    def _refresh_quality_metrics(self, parsed):
+        comments = parsed['comments']
+        collection = parsed['collection']
+        worthy = parsed['worthy']
+        unworthy = parsed['unworthy']
+        total_votes = worthy + unworthy
+        score_rate = worthy / total_votes * 100 if total_votes > 0 else 100
+        weights = CONFIG['score_weights']
+
+        parsed['score_rate'] = round(score_rate) if total_votes > 0 else 100
+        parsed['composite_score'] = (
+            comments * weights['comments']
+            + collection * weights['collection']
+            + worthy * weights['worthy']
+        )
+
+    def _upgrade_comment_count_from_module(self, parsed, coverage):
+        module_total = int(coverage.get('module_total') or 0)
+        current_comments = int(parsed.get('comments', 0) or 0)
+        if module_total <= current_comments:
+            return
+
+        parsed['comments'] = module_total
+        parsed['comment_count_note'] = f"评论数按详情模块更新：{current_comments}->{module_total}"
+        self._refresh_quality_metrics(parsed)
+        self.stats['total_comment_count_upgraded'] += 1
+        logging.info(
+            f"[评论总数更新] {parsed['title'][:40]}... | "
+            f"列表:{current_comments} 模块:{module_total} "
+            f"新评分:{parsed.get('composite_score', 0)}"
+        )
+
     def _prioritize_candidates(self, candidates):
         """把有限的评论校验预算优先用在早期/高风险候选上。"""
         path_rank = {
             '早期好价': 4,
+            '早期强信号': 4,
             '高讨论': 3,
             '均衡热度': 2,
         }
@@ -848,9 +940,51 @@ class SmzdmScraper:
         if article_link:
             return article_link
 
+        channel_data = self._get_channel_article_data(parsed)
+        article_link = channel_data.get('article_link')
+        if article_link:
+            parsed['article_link'] = article_link
+            return article_link
+
+        return ''
+
+    def _enrich_candidates_from_channel_apis(self, candidates):
+        for parsed in candidates:
+            channel_data = self._get_channel_article_data(parsed)
+            if not channel_data:
+                continue
+
+            enriched = False
+            article_link = channel_data.get('article_link')
+            if article_link and not parsed.get('article_link'):
+                parsed['article_link'] = article_link
+                enriched = True
+
+            for field in ('mall_no', 'product_no'):
+                value = channel_data.get(field)
+                if value and not parsed.get(field):
+                    parsed[field] = value
+                    enriched = True
+
+            product_key = self._build_product_key(parsed)
+            if product_key and parsed.get('product_key') != product_key:
+                parsed['product_key'] = product_key
+                enriched = True
+
+            if enriched:
+                self.stats['total_channel_metadata_enriched'] += 1
+                logging.info(
+                    f"[频道元数据补充] {parsed['title'][:40]}... | "
+                    f"link:{'有' if parsed.get('article_link') else '无'} "
+                    f"sku:{parsed.get('product_key') or '-'}"
+                )
+
+    def _get_channel_article_data(self, parsed):
         article_id = parsed['id']
+        if article_id in self.article_data_cache:
+            return self.article_data_cache[article_id]
         if article_id in self.article_link_cache:
-            return self.article_link_cache[article_id]
+            return {'article_link': self.article_link_cache[article_id]}
 
         endpoints = []
         if parsed.get('channel_type') == 'faxian':
@@ -860,20 +994,26 @@ class SmzdmScraper:
         endpoints.extend(['youhui/list', 'faxian/list'])
 
         for endpoint in dict.fromkeys(endpoints):
-            found = self._lookup_article_link_from_channel_api(article_id, endpoint)
+            found = self._lookup_article_data_from_channel_api(article_id, endpoint)
             if found:
-                self.article_link_cache[article_id] = found
+                if found.get('article_link'):
+                    self.article_link_cache[article_id] = found['article_link']
+                self.article_data_cache[article_id] = found
                 return found
 
         self.article_link_cache[article_id] = ''
-        return ''
+        self.article_data_cache[article_id] = {}
+        return {}
 
     def _lookup_article_link_from_channel_api(self, article_id, endpoint):
-        endpoint_cache = self.channel_article_link_cache.setdefault(endpoint, {})
+        return self._lookup_article_data_from_channel_api(article_id, endpoint).get('article_link', '')
+
+    def _lookup_article_data_from_channel_api(self, article_id, endpoint):
+        endpoint_cache = self.channel_article_data_cache.setdefault(endpoint, {})
         if article_id in endpoint_cache:
             return endpoint_cache[article_id]
         if endpoint in self.channel_link_exhausted:
-            return ''
+            return {}
 
         page_size = CONFIG['jd_link_lookup_page_size']
         start_page = self.channel_link_pages_loaded.get(endpoint, 0)
@@ -897,13 +1037,21 @@ class SmzdmScraper:
             for item in rows:
                 item_id = str(item.get('article_id', '')).strip()
                 if item_id:
-                    endpoint_cache[item_id] = str(item.get('article_link', '')).strip()
+                    endpoint_cache[item_id] = self._extract_channel_article_data(item)
             self.channel_link_pages_loaded[endpoint] = page + 1
 
             if article_id in endpoint_cache:
                 return endpoint_cache[article_id]
             time.sleep(0.1)
-        return ''
+        return {}
+
+    def _extract_channel_article_data(self, item):
+        mall_no, product_no = self._extract_mall_client(item)
+        return {
+            'article_link': str(item.get('article_link') or '').strip(),
+            'mall_no': mall_no,
+            'product_no': product_no,
+        }
 
     def _resolve_smzdm_go_link(self, article_link, referer):
         """解析 SMZDM go 链接到最终京东商品链接。"""
@@ -1087,6 +1235,20 @@ class SmzdmScraper:
             return True
 
         if parsed.get('comments', 0) < CONFIG['comment_level_min_comments']:
+            if self._is_early_signal_path(parsed):
+                parsed['comment_level_status'] = 'skipped'
+                parsed['comment_level_note'] = (
+                    f"早期强信号，列表评论{parsed.get('comments', 0)}条，评论可能审核延迟，跳过等级判断"
+                )
+                parsed.pop('comment_level_stats', None)
+                parsed.pop('comment_level_unavailable_reason', None)
+                logging.info(
+                    f"[早期强信号评论跳过] {parsed['title'][:40]}... | "
+                    f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                    f"值:{parsed.get('worthy', 0)} 评分:{parsed.get('composite_score', 0)} "
+                    f"好评率:{parsed.get('score_rate', 0)}%"
+                )
+                return True
             self._mark_comment_level_unavailable(parsed, 'low_comments')
             logging.info(
                 f"[评论等级跳过] {parsed['title'][:40]}... | "
@@ -1105,6 +1267,7 @@ class SmzdmScraper:
         level_stats = self._build_comment_level_stats(samples)
         coverage = self._build_comment_module_coverage(parsed, comment_meta)
         parsed['comment_module_coverage'] = coverage
+        self._upgrade_comment_count_from_module(parsed, coverage)
 
         if not coverage['representative']:
             if coverage['expected'] >= CONFIG['comment_module_undercovered_skip_min_comments']:
@@ -1389,6 +1552,19 @@ class SmzdmScraper:
             )
             return True
 
+        if self._is_early_signal_path(parsed):
+            parsed['comment_level_status'] = 'skipped'
+            parsed['comment_level_note'] = (
+                f"早期强信号，评论等级未确认:{reason}，按评论审核延迟处理"
+            )
+            logging.info(
+                f"[早期强信号评论放行] {parsed['title'][:40]}... | "
+                f"原因:{reason} 评分:{parsed.get('composite_score', 0)} "
+                f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                f"值:{parsed.get('worthy', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+            )
+            return False
+
         if quality_path == '早期好价' and CONFIG.get('defer_emerging_when_comment_unavailable'):
             logging.info(
                 f"[早期好价暂缓] {parsed['title'][:40]}... | "
@@ -1431,6 +1607,10 @@ class SmzdmScraper:
             and parsed.get('composite_score', 0) >= CONFIG['fallback_min_score']
         )
 
+    @staticmethod
+    def _is_early_signal_path(parsed):
+        return parsed.get('quality_path') == '早期强信号'
+
     def _fetch_comment_samples(self, article_id):
         empty_meta = {
             'module_total': 0,
@@ -1464,8 +1644,12 @@ class SmzdmScraper:
         all_samples = []
         self._collect_comment_samples(resp_json, all_samples, include_author=True)
         all_samples = self._dedupe_comment_samples(all_samples)
-        samples = [sample for sample in all_samples if not sample.get('display_author')]
-        meta = self._extract_comment_module_meta(resp_json, all_samples, samples)
+        author_ids = self._extract_comment_author_ids(resp_json)
+        samples = [
+            sample for sample in all_samples
+            if not self._is_author_comment_sample(sample, author_ids)
+        ]
+        meta = self._extract_comment_module_meta(resp_json, all_samples, samples, author_ids)
         return samples, meta
 
     def _collect_comment_samples(self, node, samples, include_author=False):
@@ -1490,7 +1674,32 @@ class SmzdmScraper:
                 self._collect_comment_samples(value, samples, include_author=include_author)
 
     @staticmethod
-    def _extract_comment_module_meta(resp_json, all_samples, samples):
+    def _extract_comment_author_ids(resp_json):
+        hot_comments = {}
+        if isinstance(resp_json, dict):
+            hot_comments = (
+                resp_json.get('data', {})
+                .get('comments', {})
+                .get('hot_comments_b', {})
+            )
+        author_ids = set()
+        if isinstance(hot_comments, dict):
+            for field in ('author_smzdm_id', 'author_id'):
+                author_id = str(hot_comments.get(field) or '').strip()
+                if author_id:
+                    author_ids.add(author_id)
+        return author_ids
+
+    @staticmethod
+    def _is_author_comment_sample(sample, author_ids=None):
+        if sample.get('display_author'):
+            return True
+        author_ids = author_ids or set()
+        user_id = str(sample.get('user_id') or '').strip()
+        return bool(user_id and user_id in author_ids)
+
+    @staticmethod
+    def _extract_comment_module_meta(resp_json, all_samples, samples, author_ids=None):
         hot_comments = {}
         if isinstance(resp_json, dict):
             hot_comments = (
@@ -1507,7 +1716,10 @@ class SmzdmScraper:
             'module_total': module_total,
             'module_rows': len(rows) if isinstance(rows, list) else 0,
             'all_count': len(all_samples),
-            'author_count': sum(1 for sample in all_samples if sample.get('display_author')),
+            'author_count': sum(
+                1 for sample in all_samples
+                if SmzdmScraper._is_author_comment_sample(sample, author_ids)
+            ),
             'non_author_count': len(samples),
         }
 
@@ -1638,6 +1850,8 @@ class SmzdmScraper:
         quality_path = data.get('quality_path', '综合筛选')
         level_stats = data.get('comment_level_stats') or {}
         comment_level_note = data.get('comment_level_note')
+        comment_count_note = data.get('comment_count_note')
+        comment_module_coverage = data.get('comment_module_coverage') or {}
         price_drop_note = data.get('price_drop_note')
 
         if composite_score >= 100:
@@ -1673,6 +1887,21 @@ class SmzdmScraper:
         note_line = ''
         if comment_level_note:
             note_line = f"🧪 评论判断：{html.escape(str(comment_level_note), quote=True)}<br>"
+        comment_count_suffix = ''
+        if comment_count_note:
+            comment_count_suffix = (
+                f" <span style=\"color:#777;\">"
+                f"({html.escape(str(comment_count_note), quote=True)})</span>"
+            )
+        coverage_line = ''
+        if comment_module_coverage and comment_module_coverage.get('expected'):
+            returned = int(comment_module_coverage.get('returned') or 0)
+            expected = int(comment_module_coverage.get('expected') or 0)
+            ratio = int((comment_module_coverage.get('ratio') or 0) * 100)
+            coverage_status = '覆盖足够' if comment_module_coverage.get('representative') else '覆盖不足'
+            coverage_line = (
+                f"🧩 评论覆盖：{returned}/{expected}（{ratio}% / {coverage_status}）<br>"
+            )
         price_drop_line = ''
         if price_drop_note:
             price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
@@ -1691,7 +1920,8 @@ class SmzdmScraper:
           📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
           {price_drop_line}
           👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
-          💬 评论：{data['comments']} | ⭐ 收藏：{data['collection']}<br>
+          💬 评论：{data['comments']}{comment_count_suffix} | ⭐ 收藏：{data['collection']}<br>
+          {coverage_line}
           {level_line}
           {note_line}
           <div style="margin-top:10px;">
@@ -1707,24 +1937,52 @@ class SmzdmScraper:
             parsed = article_id
             if parsed['id'] in self.seen_ids:
                 return True
+            if self._is_product_key_duplicate(parsed):
+                return True
             # 只拦截历史中已成功推送过的相似商品；未推送商品不会写入指纹，后续扫描仍可复评。
             return self._is_fingerprint_duplicate(parsed)
         return article_id in self.seen_ids
 
+    def _is_send_duplicate(self, parsed):
+        if self._is_product_key_duplicate(parsed):
+            return True
+        return self._is_fingerprint_duplicate(parsed)
+
+    def _is_product_key_duplicate(self, parsed):
+        product_key = parsed.get('product_key') or self._build_product_key(parsed)
+        if product_key and product_key in self.seen_product_keys:
+            if self._is_meaningful_price_drop_by_key(
+                    parsed, product_key, self.product_key_min_prices, '同 SKU'):
+                return False
+            self.stats['total_product_key_duplicates'] += 1
+            logging.info(f"[同 SKU 重复跳过] {parsed['title'][:40]}... | key:{product_key}")
+            return True
+        return False
+
     def _is_fingerprint_duplicate(self, parsed):
         fingerprint = parsed.get('fingerprint')
         if fingerprint and fingerprint in self.seen_fingerprints:
-            if self._is_meaningful_price_drop(parsed):
+            if self._is_meaningful_price_drop_by_key(
+                    parsed, fingerprint, self.fingerprint_min_prices, '相似商品'):
                 return False
             self.stats['total_fingerprint_duplicates'] += 1
             logging.info(f"[相似商品重复跳过] {parsed['title'][:40]}... | 指纹:{fingerprint}")
             return True
         return False
 
-    def _is_meaningful_price_drop(self, parsed):
-        fingerprint = parsed.get('fingerprint')
+    @staticmethod
+    def _build_product_key(parsed):
+        product_no = str(parsed.get('product_no') or '').strip()
+        if not product_no:
+            return ''
+        mall = str(parsed.get('mall') or '').strip().lower()
+        mall_no = str(parsed.get('mall_no') or '').strip()
+        mall_part = mall_no or mall or 'unknown'
+        return f"{mall_part}:{product_no}".lower()
+
+    def _is_meaningful_price_drop_by_key(self, parsed, dedupe_key, min_price_map, label):
         new_price = parsed.get('price_value')
-        old_price = self.fingerprint_min_prices.get(fingerprint)
+        old_price = min_price_map.get(dedupe_key)
         if new_price is None or old_price is None or old_price <= 0:
             return False
 
@@ -1732,16 +1990,16 @@ class SmzdmScraper:
         drop_percent = drop_amount / old_price * 100
         if (drop_amount >= CONFIG['price_drop_min_amount']
                 or drop_percent >= CONFIG['price_drop_min_percent']):
-            parsed['price_drop_note'] = f"较历史推送低 {drop_amount:.2f} 元（{drop_percent:.1f}%）"
+            parsed['price_drop_note'] = f"较历史{label}推送低 {drop_amount:.2f} 元（{drop_percent:.1f}%）"
             logging.info(
-                f"[相似商品降价放行] {parsed['title'][:40]}... | "
+                f"[{label}降价放行] {parsed['title'][:40]}... | "
                 f"历史:{old_price:.2f} 新价:{new_price:.2f} 降幅:{drop_percent:.1f}%"
             )
             return True
         return False
 
     def _pending_review_key(self, parsed):
-        return parsed.get('fingerprint') or f"id:{parsed.get('id')}"
+        return parsed.get('product_key') or parsed.get('fingerprint') or f"id:{parsed.get('id')}"
 
     def _get_pending_review(self, parsed):
         review_key = self._pending_review_key(parsed)
@@ -1818,13 +2076,16 @@ class SmzdmScraper:
         try:
             self.conn.execute(
                 '''
-                INSERT OR REPLACE INTO history (id, title, fingerprint, mall, price, price_value, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT OR REPLACE INTO history (
+                    id, title, fingerprint, product_key, mall, price, price_value, last_seen
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''',
                 (
                     data['id'],
                     data['title'][:100],
                     data.get('fingerprint', ''),
+                    data.get('product_key') or self._build_product_key(data),
                     data.get('mall', ''),
                     data.get('price', ''),
                     data.get('price_value'),
@@ -1839,6 +2100,14 @@ class SmzdmScraper:
                     old_price = self.fingerprint_min_prices.get(data['fingerprint'])
                     if old_price is None or price_value < old_price:
                         self.fingerprint_min_prices[data['fingerprint']] = price_value
+            product_key = data.get('product_key') or self._build_product_key(data)
+            if product_key:
+                self.seen_product_keys.add(product_key)
+                price_value = data.get('price_value')
+                if price_value is not None:
+                    old_price = self.product_key_min_prices.get(product_key)
+                    if old_price is None or price_value < old_price:
+                        self.product_key_min_prices[product_key] = price_value
         except Exception as e:
             logging.error(f"保存历史失败: {e}")
 
@@ -1863,7 +2132,10 @@ class SmzdmScraper:
         logging.info("=" * 50)
         logging.info(f"扫描完成:")
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
+        logging.info(f"  频道元数据补充: {self.stats['total_channel_metadata_enriched']}")
+        logging.info(f"  详情评论数更新: {self.stats['total_comment_count_upgraded']}")
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
+        logging.info(f"  同 SKU 重复: {self.stats['total_product_key_duplicates']}")
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
         logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")

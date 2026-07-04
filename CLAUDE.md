@@ -23,13 +23,13 @@ The script is single-run mode: scan once -> filter -> push -> exit. There is no 
 
 **`smzdm.py`** is the main script and contains `SmzdmScraper`.
 
-- **Data source**: `https://api.smzdm.com/v1/list?limit=20&offset=N`
+- **Data source**: `https://api.smzdm.com/v1/list?limit=20&offset=N`, enriched by `faxian/list` and `youhui/list` channel APIs when available.
 - **Channel filter**: only `faxian` and `youhui`.
 - **Time window**: max 6 hours.
 - **Stage 1 filter**: weighted engagement scoring: `comments * 3 + collection * 2 + worthy`.
 - **Stage 2 filter**: comment user level and comment concentration checks from `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`.
 - **Stage 3 fallback**: interaction anomaly detection using worthy/unworthy ratio and comment/worthy ratio.
-- **Dedup**: SQLite `history` table plus in-memory article IDs and title fingerprints.
+- **Dedup**: SQLite `history` table plus in-memory article IDs, platform SKU keys when `article_mall_client.product_no` exists, and title fingerprints.
 - **Pending review**: SQLite `pending_reviews` table for deals whose comment level data is unavailable and should be rechecked in later runs.
 - **Push**: WXPusher HTML message.
 
@@ -40,6 +40,7 @@ Stage 1 has three acceptance paths:
 - `均衡热度`: total engagement >= 15, composite score >= 45, score rate >= 70%.
 - `高讨论`: comments >= 8, total engagement >= 20, composite score >= 70, score rate >= 70%.
 - `早期好价`: worthy >= 4, comments >= 3, total engagement >= 12, composite score >= 25, score rate >= 90%.
+- `早期强信号`: worthy >= 4, collection >= 5, total engagement >= 10, composite score >= 22, score rate >= 95%. This path exists for comment-review delay and does not require comments >= 3.
 
 Basic signal requirement:
 
@@ -50,7 +51,9 @@ There is currently no title keyword or category/tag hard exclusion. Carrier card
 
 ## Comment-Level Logic
 
-Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis.
+Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis. Author comments are excluded by both `display_author` and module `author_smzdm_id`.
+
+If the module-declared total comment count is higher than the list API comment count, the script upgrades the candidate comment count and recomputes the composite score from that module total.
 
 Before applying level/concentration rules, the scraper checks module coverage by comparing raw returned comment nodes with `max(list API comment count, module-declared total comments)`. Samples are considered representative only when they cover about 80% of that total or differ by at most 2 comments. If the total already has at least 10 comments but the module only returns a small hot-comment subset, comment-level shill judgment is skipped instead of filtering or deferring on those few samples.
 
@@ -65,7 +68,8 @@ Before applying level/concentration rules, the scraper checks module coverage by
 Unavailable comment data is not treated as an automatic pass:
 
 - The per-run comment check budget is dynamic: check all normally checkable candidates, capped at 80 to avoid excessive external requests during candidate spikes.
-- Emerging deals are deferred when comment levels are unavailable.
+- Normal emerging deals are deferred when comment levels are unavailable.
+- Early strong-signal deals skip comment-level judgment when list comments are below the comment-level threshold, because SMZDM comments can lag while awaiting review.
 - Balanced/high-discussion deals are deferred when data is unavailable, then may fallback after repeated unavailable observations for allowed reasons (`sample`, `external`) only if score rate >= 85%, comments >= 15, and composite score >= 90.
 - Budget-unavailable deals are deferred unless they are strong signals: composite score >= 120 and comments >= 20.
 - Pending review records are kept for 2 days.
@@ -80,8 +84,9 @@ The old JD self-check helpers remain in the code behind `jd_self_filter_enabled`
 
 - Only successfully pushed deals are saved to `history`.
 - Same article ID is skipped after being saved.
+- Same platform SKU key is skipped when channel APIs expose `article_mall_client.product_no`.
 - Similar title fingerprints are deduped for 3 days.
-- Same fingerprint can be pushed again if the new price is at least 5 RMB lower or at least 5% lower than the previous pushed minimum.
+- Same SKU or fingerprint can be pushed again if the new price is at least 5 RMB lower or at least 5% lower than the previous pushed minimum.
 - Deferred, filtered, or failed-push deals are not written to `history`, so later scans can reevaluate them with newer data.
 
 ## Deployment
@@ -100,6 +105,7 @@ Note: `actions/cache` is not a fully reliable mutable database store. Closely sp
 
 - Dependency list is intentionally minimal: `requests`.
 - `tongji_hudong` is parsed for precise interaction data (`评论_5,收藏_3,值_10,不值_2`) with top-level field fallback.
+- `faxian/list` and `youhui/list` are used as low-risk metadata enrichment sources for `article_link`, `mall_no`, and `product_no`; external go-link resolution is not part of core filtering.
 - External comment/detail requests are throttled with random delays.
 - WAF-like responses (`202`, `403`, `429`, captcha markers, `probe.js`, access-frequency text) suspend external checks for the rest of the current run.
-- Notification content includes score tag, price, score rate, engagement numbers, comment level stats when available, price-drop notes, and the SMZDM detail link.
+- Notification content includes score tag, price, score rate, engagement numbers, comment coverage, comment level stats when available, price-drop notes, and the SMZDM detail link.
