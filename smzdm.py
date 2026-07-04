@@ -12,7 +12,7 @@ import logging
 import re
 import html
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -55,6 +55,16 @@ CONFIG = {
     "early_signal_min_total_engagement": 10,
     "early_signal_min_composite_score": 22,
     "early_signal_min_score_rate": 95,
+    "super_deal_min_comments": 20,       # 超级好价：高值率、高评论、高收藏和值票
+    "super_deal_min_worthy": 20,
+    "super_deal_min_collection": 10,
+    "super_deal_min_composite_score": 120,
+    "super_deal_min_score_rate": 90,
+    "warming_min_growth_score": 10,      # 升温好价：依赖多轮扫描中的真实增长
+    "warming_min_composite_score": 24,
+    "warming_min_total_engagement": 10,
+    "warming_min_score_rate": 90,
+    "warming_recent_min_growth_score": 6,
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -95,6 +105,7 @@ CONFIG = {
     "comment_level_check_min_per_run": 8,
     "comment_level_check_candidate_ratio": 1.0, # 常规情况下校验全部可校验候选，避免预算导致半小时级延迟
     "max_comment_level_checks_per_run": 80,     # 保留硬上限，避免候选异常暴增时连续撞外部接口
+    "defer_comment_unavailable": False,          # 评论等级不可用只做诊断，不再阻断互动/趋势评分通过的商品
     "defer_emerging_when_comment_unavailable": True,
     "pending_review_fallback_runs": 2,
     "pending_review_keep_days": 2,
@@ -124,12 +135,26 @@ CONFIG = {
     "shill_max_worthy_unworthy_ratio": 20,  # 值/不值比超过此值则可疑指标+1
     "shill_min_comment_worthy_ratio": 0.2,  # 评论数/值票数低于此值则可疑指标+1
     "shill_min_flags": 2,                   # 至少N个可疑指标才标记为水军
+    "trend_stale_filter_enabled": True,      # 初始有票但多轮不增长时降噪
+    "trend_stale_min_age_minutes": 60,
+    "trend_stale_max_growth_score": 3,
+    "trend_stale_max_comments": 5,
 
     # 去重参数
     "fingerprint_dedupe_days": 3,       # 同商品标题指纹在 N 天内只推一次
     "fingerprint_min_len": 8,
     "price_drop_min_percent": 5,        # 同商品降价超过 5% 允许再次推送
     "price_drop_min_amount": 5,         # 或至少便宜 5 元允许再次推送
+
+    # 候选快照和趋势评分
+    "snapshot_keep_days": 2,
+    "snapshot_min_collection": 2,
+    "trend_weights": {
+        "worthy": 3,
+        "collection": 2,
+        "comments": 4,
+        "unworthy": -2,
+    },
 
     # 请求参数
     "request_delay": (0.5, 1.5),        # 随机延迟范围（秒）
@@ -167,6 +192,9 @@ class SmzdmScraper:
             'total_product_key_duplicates': 0,
             'total_channel_metadata_enriched': 0,
             'total_comment_count_upgraded': 0,
+            'total_candidate_snapshots_saved': 0,
+            'total_trend_candidates': 0,
+            'total_filtered_trend_stale': 0,
             'total_filtered_stage1': 0,
             'total_filtered_jd_self': 0,
             'total_filtered_comment_level': 0,
@@ -196,6 +224,8 @@ class SmzdmScraper:
         self.comment_level_checks = 0
         self.comment_level_check_limit = CONFIG['comment_level_check_min_per_run']
         self.external_checks_suspended = False
+        self.snapshot_keys_seen_this_run = set()
+        self.pending_snapshot_writes = 0
 
     def _init_session(self):
         retry = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
@@ -241,6 +271,36 @@ class SmzdmScraper:
                 last_reason TEXT
             )
         ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS candidate_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_key TEXT NOT NULL,
+                article_id TEXT,
+                title TEXT,
+                fingerprint TEXT,
+                product_key TEXT,
+                mall TEXT,
+                price TEXT,
+                price_value REAL,
+                comments INTEGER,
+                collection INTEGER,
+                worthy INTEGER,
+                unworthy INTEGER,
+                score_rate REAL,
+                composite_score INTEGER,
+                age_hours REAL,
+                quality_path TEXT,
+                captured_at TEXT NOT NULL
+            )
+        ''')
+        self.conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_key_time '
+            'ON candidate_snapshots (item_key, captured_at)'
+        )
+        self.conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_article_time '
+            'ON candidate_snapshots (article_id, captured_at)'
+        )
         self.conn.commit()
 
     def _ensure_history_columns(self):
@@ -401,6 +461,9 @@ class SmzdmScraper:
                     self.stats['total_duplicates'] += 1
                     continue
 
+                self._attach_trend_metrics(parsed)
+                self._save_candidate_snapshot(parsed)
+
                 # 第一阶段：综合评分筛选
                 if not self._filter_stage1(parsed):
                     self.stats['total_filtered_stage1'] += 1
@@ -409,8 +472,10 @@ class SmzdmScraper:
                 candidates.append(parsed)
                 self.seen_ids.add(parsed['id'])  # 立即标记，防止跨页重复
 
+            self._commit_candidate_snapshots()
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
+        self._commit_candidate_snapshots()
         return candidates
 
     def _fetch_page(self, page):
@@ -593,6 +658,203 @@ class SmzdmScraper:
             return min(values)
         return values[-1]
 
+    # ==================== 趋势快照 ====================
+
+    def _attach_trend_metrics(self, parsed):
+        key = self._candidate_snapshot_key(parsed)
+        if not key:
+            parsed['trend_metrics'] = self._empty_trend_metrics()
+            return
+
+        cursor = self.conn.execute(
+            '''
+            SELECT captured_at, comments, collection, worthy, unworthy
+            FROM candidate_snapshots
+            WHERE item_key = ?
+            ORDER BY captured_at ASC
+            ''',
+            (key,)
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            parsed['trend_metrics'] = self._empty_trend_metrics()
+            return
+
+        first = rows[0]
+        previous = rows[-1]
+        now = datetime.utcnow()
+        first_time = self._parse_snapshot_time(first[0])
+        previous_time = self._parse_snapshot_time(previous[0])
+        elapsed_minutes = self._minutes_between(first_time, now)
+        recent_minutes = self._minutes_between(previous_time, now)
+
+        first_delta = self._build_growth_delta(parsed, first)
+        recent_delta = self._build_growth_delta(parsed, previous)
+        growth_score = self._calculate_growth_score(first_delta)
+        recent_growth_score = self._calculate_growth_score(recent_delta)
+
+        parsed['trend_metrics'] = {
+            'snapshot_count': len(rows),
+            'item_key': key,
+            'elapsed_minutes': round(elapsed_minutes),
+            'recent_minutes': round(recent_minutes),
+            'delta_comments': first_delta['comments'],
+            'delta_collection': first_delta['collection'],
+            'delta_worthy': first_delta['worthy'],
+            'delta_unworthy': first_delta['unworthy'],
+            'recent_delta_comments': recent_delta['comments'],
+            'recent_delta_collection': recent_delta['collection'],
+            'recent_delta_worthy': recent_delta['worthy'],
+            'recent_delta_unworthy': recent_delta['unworthy'],
+            'growth_score': growth_score,
+            'recent_growth_score': recent_growth_score,
+            'growth_per_hour': round(growth_score / max(elapsed_minutes / 60, 0.25), 1),
+        }
+        self.stats['total_trend_candidates'] += 1
+
+    @staticmethod
+    def _empty_trend_metrics():
+        return {
+            'snapshot_count': 0,
+            'elapsed_minutes': 0,
+            'recent_minutes': 0,
+            'delta_comments': 0,
+            'delta_collection': 0,
+            'delta_worthy': 0,
+            'delta_unworthy': 0,
+            'recent_delta_comments': 0,
+            'recent_delta_collection': 0,
+            'recent_delta_worthy': 0,
+            'recent_delta_unworthy': 0,
+            'growth_score': 0,
+            'recent_growth_score': 0,
+            'growth_per_hour': 0,
+        }
+
+    @staticmethod
+    def _parse_snapshot_time(value):
+        if not value:
+            return datetime.utcnow()
+        text = str(value).replace('Z', '+00:00')
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                parsed = datetime.strptime(str(value), '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return datetime.utcnow()
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
+    def _minutes_between(start, end):
+        return max(0, (end - start).total_seconds() / 60)
+
+    @staticmethod
+    def _build_growth_delta(parsed, row):
+        return {
+            'comments': max(0, int(parsed.get('comments', 0) or 0) - int(row[1] or 0)),
+            'collection': max(0, int(parsed.get('collection', 0) or 0) - int(row[2] or 0)),
+            'worthy': max(0, int(parsed.get('worthy', 0) or 0) - int(row[3] or 0)),
+            'unworthy': max(0, int(parsed.get('unworthy', 0) or 0) - int(row[4] or 0)),
+        }
+
+    @staticmethod
+    def _calculate_growth_score(delta):
+        weights = CONFIG['trend_weights']
+        return (
+            delta['comments'] * weights['comments']
+            + delta['collection'] * weights['collection']
+            + delta['worthy'] * weights['worthy']
+            + delta['unworthy'] * weights['unworthy']
+        )
+
+    def _save_candidate_snapshot(self, parsed):
+        if not self._should_save_candidate_snapshot(parsed):
+            return
+
+        item_key = self._candidate_snapshot_key(parsed)
+        if not item_key or item_key in self.snapshot_keys_seen_this_run:
+            return
+        self.snapshot_keys_seen_this_run.add(item_key)
+
+        metrics = self._current_interaction_metrics(parsed)
+        self.conn.execute(
+            '''
+            INSERT INTO candidate_snapshots (
+                item_key, article_id, title, fingerprint, product_key, mall,
+                price, price_value, comments, collection, worthy, unworthy,
+                score_rate, composite_score, age_hours, quality_path, captured_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                item_key,
+                parsed.get('id'),
+                parsed.get('title', '')[:100],
+                parsed.get('fingerprint', ''),
+                parsed.get('product_key') or self._build_product_key(parsed),
+                parsed.get('mall', ''),
+                parsed.get('price', ''),
+                parsed.get('price_value'),
+                parsed.get('comments', 0),
+                parsed.get('collection', 0),
+                parsed.get('worthy', 0),
+                parsed.get('unworthy', 0),
+                metrics['score_rate'],
+                metrics['composite_score'],
+                parsed.get('age_hours', 0),
+                parsed.get('quality_path', ''),
+                datetime.utcnow().isoformat(timespec='seconds'),
+            )
+        )
+        self.pending_snapshot_writes += 1
+        self.stats['total_candidate_snapshots_saved'] += 1
+
+    def _commit_candidate_snapshots(self):
+        if self.pending_snapshot_writes <= 0:
+            return
+        self.conn.commit()
+        self.pending_snapshot_writes = 0
+
+    def _should_save_candidate_snapshot(self, parsed):
+        if self._is_inactive_deal(parsed):
+            return False
+        return (
+            parsed.get('worthy', 0) >= 1
+            or parsed.get('comments', 0) >= 1
+            or parsed.get('collection', 0) >= CONFIG['snapshot_min_collection']
+        )
+
+    def _candidate_snapshot_key(self, parsed):
+        product_key = parsed.get('product_key') or self._build_product_key(parsed)
+        if product_key:
+            return f"sku:{product_key}"
+        fingerprint = parsed.get('fingerprint')
+        if fingerprint:
+            return f"fp:{fingerprint}"
+        article_id = parsed.get('id')
+        return f"id:{article_id}" if article_id else ''
+
+    @staticmethod
+    def _current_interaction_metrics(parsed):
+        comments = parsed.get('comments', 0) or 0
+        collection = parsed.get('collection', 0) or 0
+        worthy = parsed.get('worthy', 0) or 0
+        unworthy = parsed.get('unworthy', 0) or 0
+        total_votes = worthy + unworthy
+        weights = CONFIG['score_weights']
+        return {
+            'total_engagement': comments + collection + worthy,
+            'score_rate': round(worthy / total_votes * 100) if total_votes > 0 else 100,
+            'composite_score': (
+                comments * weights['comments']
+                + collection * weights['collection']
+                + worthy * weights['worthy']
+            ),
+        }
+
     # ==================== 筛选 ====================
 
     def _filter_stage1(self, parsed):
@@ -601,7 +863,6 @@ class SmzdmScraper:
         collection = parsed['collection']
         worthy = parsed['worthy']
         unworthy = parsed['unworthy']
-        weights = CONFIG['score_weights']
 
         if self._is_inactive_deal(parsed):
             return False
@@ -609,30 +870,34 @@ class SmzdmScraper:
         if worthy < CONFIG['min_signal_worthy'] and comments < CONFIG['min_signal_comments']:
             return False
 
-        # 基础门槛：总互动量
-        total_engagement = comments + collection + worthy
-
-        # 好评率检查
+        metrics = self._current_interaction_metrics(parsed)
+        total_engagement = metrics['total_engagement']
+        score_rate = metrics['score_rate']
+        composite_score = metrics['composite_score']
+        trend = parsed.get('trend_metrics') or self._empty_trend_metrics()
+        growth_score = trend.get('growth_score', 0)
+        recent_growth_score = trend.get('recent_growth_score', 0)
         total_votes = worthy + unworthy
-        score_rate = worthy / total_votes * 100 if total_votes > 0 else 100
+
         if total_votes >= 3 and score_rate < CONFIG['min_score_rate_relaxed']:
             return False
 
-        # 综合评分
-        composite_score = (comments * weights['comments']
-                           + collection * weights['collection']
-                           + worthy * weights['worthy'])
-
         quality_path = ''
-        if (total_engagement >= CONFIG['min_total_engagement']
-                and composite_score >= CONFIG['min_composite_score']
-                and score_rate >= CONFIG['min_score_rate']):
-            quality_path = '均衡热度'
+        if (comments >= CONFIG['super_deal_min_comments']
+                and worthy >= CONFIG['super_deal_min_worthy']
+                and collection >= CONFIG['super_deal_min_collection']
+                and composite_score >= CONFIG['super_deal_min_composite_score']
+                and score_rate >= CONFIG['super_deal_min_score_rate']):
+            quality_path = '超级好价'
         elif (comments >= CONFIG['discussion_min_comments']
               and total_engagement >= CONFIG['discussion_min_total_engagement']
               and composite_score >= CONFIG['discussion_min_composite_score']
               and score_rate >= CONFIG['min_score_rate_relaxed']):
             quality_path = '高讨论'
+        elif (total_engagement >= CONFIG['min_total_engagement']
+                and composite_score >= CONFIG['min_composite_score']
+                and score_rate >= CONFIG['min_score_rate']):
+            quality_path = '均衡热度'
         elif (worthy >= CONFIG['emerging_min_worthy']
               and comments >= CONFIG['emerging_min_comments']
               and total_engagement >= CONFIG['emerging_min_total_engagement']
@@ -645,18 +910,30 @@ class SmzdmScraper:
               and composite_score >= CONFIG['early_signal_min_composite_score']
               and score_rate >= CONFIG['early_signal_min_score_rate']):
             quality_path = '早期强信号'
+        elif (trend.get('snapshot_count', 0) > 0
+              and total_engagement >= CONFIG['warming_min_total_engagement']
+              and composite_score >= CONFIG['warming_min_composite_score']
+              and score_rate >= CONFIG['warming_min_score_rate']
+              and (
+                  growth_score >= CONFIG['warming_min_growth_score']
+                  or recent_growth_score >= CONFIG['warming_recent_min_growth_score']
+              )):
+            quality_path = '升温好价'
 
         if not quality_path:
             return False
 
         # 好评率和综合评分挂到 parsed 上，供推送使用
-        parsed['score_rate'] = round(score_rate) if total_votes > 0 else 100
+        parsed['score_rate'] = score_rate
         parsed['composite_score'] = composite_score
+        parsed['trend_score'] = growth_score
+        parsed['deal_score'] = composite_score + growth_score
         parsed['quality_path'] = quality_path
 
         logging.info(
             f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
-            f"评分:{composite_score} 好评率:{parsed['score_rate']}% 评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
+            f"评分:{composite_score} 增长:{growth_score} 好评率:{parsed['score_rate']}% "
+            f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
 
@@ -666,15 +943,13 @@ class SmzdmScraper:
         worthy = parsed['worthy']
         unworthy = parsed['unworthy']
         total_votes = worthy + unworthy
-        score_rate = worthy / total_votes * 100 if total_votes > 0 else 100
-        weights = CONFIG['score_weights']
+        metrics = self._current_interaction_metrics(parsed)
 
-        parsed['score_rate'] = round(score_rate) if total_votes > 0 else 100
-        parsed['composite_score'] = (
-            comments * weights['comments']
-            + collection * weights['collection']
-            + worthy * weights['worthy']
-        )
+        parsed['score_rate'] = metrics['score_rate'] if total_votes > 0 else 100
+        parsed['composite_score'] = metrics['composite_score']
+        trend_score = (parsed.get('trend_metrics') or {}).get('growth_score', 0)
+        parsed['trend_score'] = trend_score
+        parsed['deal_score'] = parsed['composite_score'] + trend_score
 
     def _upgrade_comment_count_from_module(self, parsed, coverage):
         module_total = int(coverage.get('module_total') or 0)
@@ -695,6 +970,8 @@ class SmzdmScraper:
     def _prioritize_candidates(self, candidates):
         """把有限的评论校验预算优先用在早期/高风险候选上。"""
         path_rank = {
+            '超级好价': 6,
+            '升温好价': 5,
             '早期好价': 4,
             '早期强信号': 4,
             '高讨论': 3,
@@ -706,6 +983,7 @@ class SmzdmScraper:
                 path_rank.get(parsed.get('quality_path'), 0),
                 parsed.get('comments', 0) >= CONFIG['comment_level_min_comments'],
                 parsed.get('composite_score', 0),
+                parsed.get('trend_score', 0),
                 parsed.get('comments', 0),
                 parsed.get('score_rate', 0),
                 parsed.get('worthy', 0),
@@ -1535,6 +1813,19 @@ class SmzdmScraper:
         quality_path = parsed.get('quality_path')
         reason = parsed.get('comment_level_unavailable_reason', 'unknown')
 
+        if not CONFIG.get('defer_comment_unavailable', True):
+            parsed['comment_level_status'] = 'skipped'
+            parsed['comment_level_note'] = (
+                f"评论等级未确认:{reason}，按互动评分和增长趋势判断"
+            )
+            logging.info(
+                f"[评论等级不可用放行] {parsed['title'][:40]}... | "
+                f"路径:{quality_path} 原因:{reason} 评分:{parsed.get('composite_score', 0)} "
+                f"增长:{parsed.get('trend_score', 0)} 评论:{parsed.get('comments', 0)} "
+                f"收藏:{parsed.get('collection', 0)} 值:{parsed.get('worthy', 0)}"
+            )
+            return False
+
         if (reason == 'budget'
                 and quality_path in ('均衡热度', '高讨论')
                 and self._is_strong_budget_pass(parsed)):
@@ -1776,6 +2067,18 @@ class SmzdmScraper:
         1. 值票极高但几乎无不值票（正常商品会有一定反对声音）
         2. 值票多但评论极少（真实用户投票的同时通常也会评论）
         """
+        if self._is_growth_stalled(parsed):
+            self.stats['total_filtered_trend_stale'] += 1
+            trend = parsed.get('trend_metrics') or {}
+            logging.warning(
+                f"[增长停滞过滤] {parsed['title'][:40]}... | "
+                f"已观察:{trend.get('elapsed_minutes', 0)}分钟 "
+                f"增长分:{trend.get('growth_score', 0)} "
+                f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                f"值:{parsed.get('worthy', 0)}"
+            )
+            return False
+
         worthy = parsed['worthy']
         unworthy = parsed['unworthy']
         comments = parsed['comments']
@@ -1810,6 +2113,24 @@ class SmzdmScraper:
             return False
 
         return True
+
+    @staticmethod
+    def _is_growth_stalled(parsed):
+        if not CONFIG.get('trend_stale_filter_enabled'):
+            return False
+        if parsed.get('quality_path') == '超级好价':
+            return False
+        trend = parsed.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        if trend.get('elapsed_minutes', 0) < CONFIG['trend_stale_min_age_minutes']:
+            return False
+        if parsed.get('comments', 0) > CONFIG['trend_stale_max_comments']:
+            return False
+        return (
+            trend.get('growth_score', 0) <= CONFIG['trend_stale_max_growth_score']
+            and trend.get('recent_growth_score', 0) <= CONFIG['trend_stale_max_growth_score']
+        )
 
     # ==================== 推送 ====================
 
@@ -1852,11 +2173,18 @@ class SmzdmScraper:
         comment_level_note = data.get('comment_level_note')
         comment_count_note = data.get('comment_count_note')
         comment_module_coverage = data.get('comment_module_coverage') or {}
+        trend = data.get('trend_metrics') or {}
         price_drop_note = data.get('price_drop_note')
 
-        if composite_score >= 100:
+        if data.get('quality_path') == '超级好价':
+            score_tag = '💎超'
+            score_label = '超级好价'
+        elif composite_score >= 100:
             score_tag = '🔥爆'
             score_label = '高热度'
+        elif data.get('quality_path') == '升温好价':
+            score_tag = '📈升'
+            score_label = '持续升温'
         elif composite_score >= 60:
             score_tag = '👍热'
             score_label = '值得看'
@@ -1902,6 +2230,14 @@ class SmzdmScraper:
             coverage_line = (
                 f"🧩 评论覆盖：{returned}/{expected}（{ratio}% / {coverage_status}）<br>"
             )
+        trend_line = ''
+        if trend.get('snapshot_count', 0) > 0:
+            trend_line = (
+                f"📈 增长：值 +{trend.get('delta_worthy', 0)} / "
+                f"收藏 +{trend.get('delta_collection', 0)} / "
+                f"评论 +{trend.get('delta_comments', 0)} "
+                f"（{trend.get('elapsed_minutes', 0)}分钟，增长分 {trend.get('growth_score', 0)}）<br>"
+            )
         price_drop_line = ''
         if price_drop_note:
             price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
@@ -1921,6 +2257,7 @@ class SmzdmScraper:
           {price_drop_line}
           👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
           💬 评论：{data['comments']}{comment_count_suffix} | ⭐ 收藏：{data['collection']}<br>
+          {trend_line}
           {coverage_line}
           {level_line}
           {note_line}
@@ -2120,11 +2457,20 @@ class SmzdmScraper:
         pending_cursor = self.conn.execute("DELETE FROM pending_reviews WHERE last_seen < ?", (pending_cutoff,))
         pending_deleted = pending_cursor.rowcount
 
+        snapshot_cutoff = datetime.utcnow() - timedelta(days=CONFIG['snapshot_keep_days'])
+        snapshot_cursor = self.conn.execute(
+            "DELETE FROM candidate_snapshots WHERE captured_at < ?",
+            (snapshot_cutoff.isoformat(timespec='seconds'),)
+        )
+        snapshot_deleted = snapshot_cursor.rowcount
+
         self.conn.commit()
         if deleted > 0:
             logging.info(f"清理 {deleted} 条过期记录")
         if pending_deleted > 0:
             logging.info(f"清理 {pending_deleted} 条过期待复评记录")
+        if snapshot_deleted > 0:
+            logging.info(f"清理 {snapshot_deleted} 条过期候选快照")
 
     # ==================== 辅助 ====================
 
@@ -2134,6 +2480,8 @@ class SmzdmScraper:
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
         logging.info(f"  频道元数据补充: {self.stats['total_channel_metadata_enriched']}")
         logging.info(f"  详情评论数更新: {self.stats['total_comment_count_upgraded']}")
+        logging.info(f"  候选快照保存: {self.stats['total_candidate_snapshots_saved']}")
+        logging.info(f"  有趋势历史候选: {self.stats['total_trend_candidates']}")
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
         logging.info(f"  同 SKU 重复: {self.stats['total_product_key_duplicates']}")
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
@@ -2155,6 +2503,7 @@ class SmzdmScraper:
         logging.info(f"  评论模块覆盖不足跳过: {self.stats['total_comment_level_undercovered_skipped']}")
         logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
+        logging.info(f"  增长停滞过滤: {self.stats['total_filtered_trend_stale']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)
