@@ -139,6 +139,25 @@ CONFIG = {
     "trend_stale_min_age_minutes": 60,
     "trend_stale_max_growth_score": 3,
     "trend_stale_max_comments": 5,
+    "trend_confirmation_enabled": True,       # 低信心早期商品先等一轮趋势确认
+    "trend_confirmation_paths": ["早期好价", "早期强信号"],
+    "trend_confirmation_min_comments": 6,
+    "trend_confirmation_min_score": 35,
+    "trend_low_growth_filter_enabled": True,  # 有历史快照但增长很慢时过滤
+    "trend_low_growth_min_age_minutes": 25,
+    "trend_low_growth_min_growth_score": 6,
+    "trend_low_growth_min_recent_score": 4,
+    "trend_low_growth_max_comments": 8,
+    "trend_low_growth_exempt_paths": ["超级好价", "高讨论", "升温好价"],
+
+    # 标题正则过滤：补齐 WXPusher 只能关键词屏蔽、无法表达“入会%京豆”的限制
+    "title_block_patterns": [
+        r"入会.{0,40}京豆",
+        r"关注.{0,30}\d+\s*(?:京豆|豆(?![\u4e00-\u9fff]))",
+        r"签到.{0,30}京豆",
+        r"(?:领|得|送|返|抽).{0,30}\d+\s*京豆",
+        r"\d+\s*京豆",
+    ],
 
     # 去重参数
     "fingerprint_dedupe_days": 3,       # 同商品标题指纹在 N 天内只推一次
@@ -195,6 +214,9 @@ class SmzdmScraper:
             'total_candidate_snapshots_saved': 0,
             'total_trend_candidates': 0,
             'total_filtered_trend_stale': 0,
+            'total_filtered_trend_low_growth': 0,
+            'total_deferred_trend_confirmation': 0,
+            'total_filtered_title_pattern': 0,
             'total_filtered_stage1': 0,
             'total_filtered_jd_self': 0,
             'total_filtered_comment_level': 0,
@@ -411,6 +433,30 @@ class SmzdmScraper:
                 self.stats['total_comment_level_deferred'] += 1
                 continue
 
+            if self._should_wait_for_trend_confirmation(parsed):
+                self.stats['total_deferred_trend_confirmation'] += 1
+                trend = parsed.get('trend_metrics') or {}
+                logging.info(
+                    f"[等待趋势确认] {parsed['title'][:40]}... | "
+                    f"路径:{parsed.get('quality_path')} 评分:{parsed.get('composite_score', 0)} "
+                    f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                    f"值:{parsed.get('worthy', 0)} 快照:{trend.get('snapshot_count', 0)}"
+                )
+                continue
+
+            if self._is_low_growth_candidate(parsed):
+                self.stats['total_filtered_trend_low_growth'] += 1
+                trend = parsed.get('trend_metrics') or {}
+                logging.warning(
+                    f"[增长过低过滤] {parsed['title'][:40]}... | "
+                    f"路径:{parsed.get('quality_path')} 已观察:{trend.get('elapsed_minutes', 0)}分钟 "
+                    f"增长分:{trend.get('growth_score', 0)} "
+                    f"近期增长:{trend.get('recent_growth_score', 0)} "
+                    f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                    f"值:{parsed.get('worthy', 0)}"
+                )
+                continue
+
             if CONFIG['shill_detection_enabled'] and not self._check_shill(parsed):
                 self.stats['total_filtered_shill'] += 1
                 continue
@@ -463,6 +509,10 @@ class SmzdmScraper:
 
                 self._attach_trend_metrics(parsed)
                 self._save_candidate_snapshot(parsed)
+
+                if self._is_title_blocked(parsed):
+                    self.stats['total_filtered_title_pattern'] += 1
+                    continue
 
                 # 第一阶段：综合评分筛选
                 if not self._filter_stage1(parsed):
@@ -856,6 +906,52 @@ class SmzdmScraper:
         }
 
     # ==================== 筛选 ====================
+
+    def _is_title_blocked(self, parsed):
+        text = f"{parsed.get('mall', '')} {parsed.get('title', '')}"
+        for pattern in CONFIG.get('title_block_patterns', []):
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                parsed['blocked_title_pattern'] = pattern
+                logging.warning(
+                    f"[标题正则过滤] {parsed['title'][:40]}... | "
+                    f"pattern:{pattern}"
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _should_wait_for_trend_confirmation(parsed):
+        if not CONFIG.get('trend_confirmation_enabled'):
+            return False
+        if parsed.get('quality_path') not in CONFIG.get('trend_confirmation_paths', []):
+            return False
+        trend = parsed.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0) > 0:
+            return False
+        return (
+            parsed.get('comments', 0) < CONFIG['trend_confirmation_min_comments']
+            and parsed.get('composite_score', 0) < CONFIG['trend_confirmation_min_score']
+        )
+
+    @staticmethod
+    def _is_low_growth_candidate(parsed):
+        if not CONFIG.get('trend_low_growth_filter_enabled'):
+            return False
+        if parsed.get('quality_path') in CONFIG.get('trend_low_growth_exempt_paths', []):
+            return False
+        if parsed.get('comments', 0) > CONFIG['trend_low_growth_max_comments']:
+            return False
+
+        trend = parsed.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        if trend.get('elapsed_minutes', 0) < CONFIG['trend_low_growth_min_age_minutes']:
+            return False
+
+        return (
+            trend.get('growth_score', 0) < CONFIG['trend_low_growth_min_growth_score']
+            and trend.get('recent_growth_score', 0) < CONFIG['trend_low_growth_min_recent_score']
+        )
 
     def _filter_stage1(self, parsed):
         """第一阶段：综合评分筛选"""
@@ -2485,7 +2581,9 @@ class SmzdmScraper:
         logging.info(f"  重复跳过: {self.stats['total_duplicates']}")
         logging.info(f"  同 SKU 重复: {self.stats['total_product_key_duplicates']}")
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
+        logging.info(f"  标题正则过滤: {self.stats['total_filtered_title_pattern']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
+        logging.info(f"  等待趋势确认: {self.stats['total_deferred_trend_confirmation']}")
         logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")
         if CONFIG['jd_self_filter_enabled']:
             logging.info(f"  京东自营校验: {self.jd_self_checks}/{self.jd_self_check_limit}")
@@ -2504,6 +2602,7 @@ class SmzdmScraper:
         logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  增长停滞过滤: {self.stats['total_filtered_trend_stale']}")
+        logging.info(f"  增长过低过滤: {self.stats['total_filtered_trend_low_growth']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)

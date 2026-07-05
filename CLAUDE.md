@@ -49,11 +49,19 @@ Basic signal requirement:
 - worthy >= 2 or comments >= 2.
 - inactive deals are filtered if sold out, timed out, expired, or ended.
 
-There is currently no title keyword or category/tag hard exclusion. Carrier cards, coupons, red packets, finance, and similar content should be blocked downstream by WXPusher keyword rules if desired.
+There is no broad title keyword or category/tag hard exclusion. Carrier cards, coupons, red packets, finance, and similar content should generally be blocked downstream by WXPusher keyword rules if desired.
+
+The script does include narrow regex title blocking for task-like Jingdou posts that WXPusher keyword matching cannot express, especially the `入会...京豆` pattern and common variants such as `关注...1豆`, `签到...京豆`, and `得10京豆`.
 
 ## Comment-Level Logic
 
 Candidate snapshots are stored in SQLite `candidate_snapshots` for 2 days. The scraper compares current worthy, collection, comments, and unworthy counts against older snapshots to compute growth score and recent growth score. This trend score is the primary substitute for unavailable full-comment level distribution.
+
+Trend data is also a filter:
+
+- Low-confidence early deals on `早期好价` or `早期强信号` wait for one later run when there is no prior snapshot and both comments and composite score are still modest.
+- Non-exempt deals with at least one prior snapshot are filtered as low-growth if they have been observed for about 25 minutes, still have few comments, and both total and recent growth scores are weak.
+- `超级好价`, `高讨论`, and `升温好价` are exempt from the low-growth filter.
 
 Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis. Author comments are excluded by both `display_author` and module `author_smzdm_id`.
 
@@ -75,7 +83,7 @@ Unavailable comment data is diagnostic by default:
 - Early strong-signal deals skip comment-level judgment when list comments are below the comment-level threshold, because SMZDM comments can lag while awaiting review.
 - Representative low-level or concentrated comment samples can still hard-filter a deal.
 - Missing, undercovered, or budget-unavailable comment data does not defer by default.
-- Initial interaction that does not grow across later snapshots can be filtered as trend-stale when comments remain low.
+- Initial interaction that does not grow across later snapshots can be filtered as low-growth or trend-stale when comments remain low.
 
 ## JD Handling
 
