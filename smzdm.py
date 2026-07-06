@@ -65,6 +65,9 @@ CONFIG = {
     "warming_min_total_engagement": 10,
     "warming_min_score_rate": 90,
     "warming_recent_min_growth_score": 6,
+    "warming_recent_max_minutes": 120,
+    "warming_cumulative_max_minutes": 180,
+    "warming_min_growth_per_hour": 6,
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -149,6 +152,13 @@ CONFIG = {
     "trend_low_growth_min_recent_score": 4,
     "trend_low_growth_max_comments": 8,
     "trend_low_growth_exempt_paths": ["超级好价", "高讨论", "升温好价"],
+    "trend_slow_filter_enabled": True,       # 长时间窗口里慢慢涨一点，不再视为升温
+    "trend_slow_min_age_minutes": 240,
+    "trend_slow_max_growth_per_hour": 2,
+    "trend_slow_max_recent_score": 3,
+    "trend_slow_max_comments": 8,
+    "trend_slow_exempt_paths": ["超级好价", "高讨论"],
+    "trend_display_recent_after_minutes": 240,
 
     # 标题正则过滤：补齐 WXPusher 只能关键词屏蔽、无法表达“入会%京豆”的限制
     "title_block_patterns": [
@@ -219,6 +229,7 @@ class SmzdmScraper:
             'total_trend_candidates': 0,
             'total_filtered_trend_stale': 0,
             'total_filtered_trend_low_growth': 0,
+            'total_filtered_trend_slow': 0,
             'total_deferred_trend_confirmation': 0,
             'total_filtered_title_pattern': 0,
             'total_filtered_stage1': 0,
@@ -435,6 +446,20 @@ class SmzdmScraper:
                 if parsed.get('comment_level_unavailable_reason') != 'budget':
                     self._save_pending_review(parsed)
                 self.stats['total_comment_level_deferred'] += 1
+                continue
+
+            if self._is_slow_growth_candidate(parsed):
+                self.stats['total_filtered_trend_slow'] += 1
+                trend = parsed.get('trend_metrics') or {}
+                logging.warning(
+                    f"[增长过慢过滤] {parsed['title'][:40]}... | "
+                    f"路径:{parsed.get('quality_path')} 已观察:{trend.get('elapsed_minutes', 0)}分钟 "
+                    f"累计增长:{trend.get('growth_score', 0)} "
+                    f"近期增长:{trend.get('recent_growth_score', 0)} "
+                    f"速率:{trend.get('growth_per_hour', 0)}/h "
+                    f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                    f"值:{parsed.get('worthy', 0)}"
+                )
                 continue
 
             if self._should_wait_for_trend_confirmation(parsed):
@@ -746,6 +771,8 @@ class SmzdmScraper:
         recent_delta = self._build_growth_delta(parsed, previous)
         growth_score = self._calculate_growth_score(first_delta)
         recent_growth_score = self._calculate_growth_score(recent_delta)
+        growth_per_hour = round(growth_score / max(elapsed_minutes / 60, 0.25), 1)
+        recent_growth_per_hour = round(recent_growth_score / max(recent_minutes / 60, 0.25), 1)
 
         parsed['trend_metrics'] = {
             'snapshot_count': len(rows),
@@ -762,7 +789,8 @@ class SmzdmScraper:
             'recent_delta_unworthy': recent_delta['unworthy'],
             'growth_score': growth_score,
             'recent_growth_score': recent_growth_score,
-            'growth_per_hour': round(growth_score / max(elapsed_minutes / 60, 0.25), 1),
+            'growth_per_hour': growth_per_hour,
+            'recent_growth_per_hour': recent_growth_per_hour,
         }
         self.stats['total_trend_candidates'] += 1
 
@@ -783,6 +811,7 @@ class SmzdmScraper:
             'growth_score': 0,
             'recent_growth_score': 0,
             'growth_per_hour': 0,
+            'recent_growth_per_hour': 0,
         }
 
     @staticmethod
@@ -957,6 +986,62 @@ class SmzdmScraper:
             and trend.get('recent_growth_score', 0) < CONFIG['trend_low_growth_min_recent_score']
         )
 
+    @staticmethod
+    def _is_slow_growth_candidate(parsed):
+        if not CONFIG.get('trend_slow_filter_enabled'):
+            return False
+        if parsed.get('quality_path') in CONFIG.get('trend_slow_exempt_paths', []):
+            return False
+        if parsed.get('comments', 0) > CONFIG['trend_slow_max_comments']:
+            return False
+
+        trend = parsed.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        if trend.get('elapsed_minutes', 0) < CONFIG['trend_slow_min_age_minutes']:
+            return False
+        if trend.get('recent_growth_score', 0) > CONFIG['trend_slow_max_recent_score']:
+            return False
+
+        return trend.get('growth_per_hour', 0) <= CONFIG['trend_slow_max_growth_per_hour']
+
+    @staticmethod
+    def _has_recent_warming_trend(trend):
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        if trend.get('recent_minutes', 0) > CONFIG['warming_recent_max_minutes']:
+            return False
+        return (
+            trend.get('recent_growth_score', 0) >= CONFIG['warming_recent_min_growth_score']
+            and trend.get('recent_growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
+        )
+
+    @staticmethod
+    def _has_cumulative_warming_trend(trend):
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        if trend.get('elapsed_minutes', 0) > CONFIG['warming_cumulative_max_minutes']:
+            return False
+        return (
+            trend.get('growth_score', 0) >= CONFIG['warming_min_growth_score']
+            and trend.get('growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
+        )
+
+    @staticmethod
+    def _has_warming_trend(trend):
+        return (
+            SmzdmScraper._has_recent_warming_trend(trend)
+            or SmzdmScraper._has_cumulative_warming_trend(trend)
+        )
+
+    @staticmethod
+    def _effective_trend_score(trend):
+        if SmzdmScraper._has_recent_warming_trend(trend):
+            return trend.get('recent_growth_score', 0)
+        if SmzdmScraper._has_cumulative_warming_trend(trend):
+            return trend.get('growth_score', 0)
+        return 0
+
     def _filter_stage1(self, parsed):
         """第一阶段：综合评分筛选"""
         comments = parsed['comments']
@@ -977,6 +1062,7 @@ class SmzdmScraper:
         trend = parsed.get('trend_metrics') or self._empty_trend_metrics()
         growth_score = trend.get('growth_score', 0)
         recent_growth_score = trend.get('recent_growth_score', 0)
+        effective_trend_score = self._effective_trend_score(trend)
         total_votes = worthy + unworthy
 
         if total_votes >= 3 and score_rate < CONFIG['min_score_rate_relaxed']:
@@ -1014,10 +1100,7 @@ class SmzdmScraper:
               and total_engagement >= CONFIG['warming_min_total_engagement']
               and composite_score >= CONFIG['warming_min_composite_score']
               and score_rate >= CONFIG['warming_min_score_rate']
-              and (
-                  growth_score >= CONFIG['warming_min_growth_score']
-                  or recent_growth_score >= CONFIG['warming_recent_min_growth_score']
-              )):
+              and self._has_warming_trend(trend)):
             quality_path = '升温好价'
 
         if not quality_path:
@@ -1026,13 +1109,15 @@ class SmzdmScraper:
         # 好评率和综合评分挂到 parsed 上，供推送使用
         parsed['score_rate'] = score_rate
         parsed['composite_score'] = composite_score
-        parsed['trend_score'] = growth_score
-        parsed['deal_score'] = composite_score + growth_score
+        parsed['trend_score'] = effective_trend_score
+        parsed['deal_score'] = composite_score + effective_trend_score
         parsed['quality_path'] = quality_path
 
         logging.info(
             f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
-            f"评分:{composite_score} 增长:{growth_score} 好评率:{parsed['score_rate']}% "
+            f"评分:{composite_score} 有效增长:{effective_trend_score} "
+            f"累计:{growth_score} 近期:{recent_growth_score} "
+            f"速率:{trend.get('growth_per_hour', 0)}/h 好评率:{parsed['score_rate']}% "
             f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
@@ -1047,7 +1132,7 @@ class SmzdmScraper:
 
         parsed['score_rate'] = metrics['score_rate'] if total_votes > 0 else 100
         parsed['composite_score'] = metrics['composite_score']
-        trend_score = (parsed.get('trend_metrics') or {}).get('growth_score', 0)
+        trend_score = self._effective_trend_score(parsed.get('trend_metrics') or {})
         parsed['trend_score'] = trend_score
         parsed['deal_score'] = parsed['composite_score'] + trend_score
 
@@ -2332,12 +2417,22 @@ class SmzdmScraper:
             )
         trend_line = ''
         if trend.get('snapshot_count', 0) > 0:
-            trend_line = (
-                f"📈 增长：值 +{trend.get('delta_worthy', 0)} / "
-                f"收藏 +{trend.get('delta_collection', 0)} / "
-                f"评论 +{trend.get('delta_comments', 0)} "
-                f"（{trend.get('elapsed_minutes', 0)}分钟，增长分 {trend.get('growth_score', 0)}）<br>"
-            )
+            if trend.get('elapsed_minutes', 0) <= CONFIG['trend_display_recent_after_minutes']:
+                trend_line = (
+                    f"📈 增长：值 +{trend.get('delta_worthy', 0)} / "
+                    f"收藏 +{trend.get('delta_collection', 0)} / "
+                    f"评论 +{trend.get('delta_comments', 0)} "
+                    f"（{trend.get('elapsed_minutes', 0)}分钟，增长分 {trend.get('growth_score', 0)}，"
+                    f"{trend.get('growth_per_hour', 0)}/h）<br>"
+                )
+            elif trend.get('recent_growth_score', 0) > 0:
+                trend_line = (
+                    f"📈 近一轮增长：值 +{trend.get('recent_delta_worthy', 0)} / "
+                    f"收藏 +{trend.get('recent_delta_collection', 0)} / "
+                    f"评论 +{trend.get('recent_delta_comments', 0)} "
+                    f"（{trend.get('recent_minutes', 0)}分钟，增长分 {trend.get('recent_growth_score', 0)}，"
+                    f"{trend.get('recent_growth_per_hour', 0)}/h）<br>"
+                )
         price_drop_line = ''
         if price_drop_note:
             price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
@@ -2607,6 +2702,7 @@ class SmzdmScraper:
         logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
         logging.info(f"  增长停滞过滤: {self.stats['total_filtered_trend_stale']}")
         logging.info(f"  增长过低过滤: {self.stats['total_filtered_trend_low_growth']}")
+        logging.info(f"  增长过慢过滤: {self.stats['total_filtered_trend_slow']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info("=" * 50)

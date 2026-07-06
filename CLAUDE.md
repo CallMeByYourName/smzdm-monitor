@@ -60,8 +60,10 @@ Candidate snapshots are stored in SQLite `candidate_snapshots` for 2 days. The s
 Trend data is also a filter:
 
 - Low-confidence early deals on `早期好价` or `早期强信号` wait for one later run when there is no prior snapshot and both comments and composite score are still modest.
+- `升温好价` requires fresh growth: either recent-run growth with enough speed, or cumulative growth inside a short window with enough per-hour growth. Old 1200-minute cumulative growth should not create a warming deal.
 - Non-exempt deals with at least one prior snapshot are filtered as low-growth if they have been observed for about 25 minutes, still have few comments, and both total and recent growth scores are weak.
-- `超级好价`, `高讨论`, and `升温好价` are exempt from the low-growth filter.
+- Deals with a long observation window, low comments, little recent growth, and weak cumulative growth speed are filtered as slow-growth.
+- `超级好价` and `高讨论` are exempt from the low-growth and slow-growth filters.
 
 Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis. Author comments are excluded by both `display_author` and module `author_smzdm_id`.
 
@@ -83,7 +85,7 @@ Unavailable comment data is diagnostic by default:
 - Early strong-signal deals skip comment-level judgment when list comments are below the comment-level threshold, because SMZDM comments can lag while awaiting review.
 - Representative low-level or concentrated comment samples can still hard-filter a deal.
 - Missing, undercovered, or budget-unavailable comment data does not defer by default.
-- Initial interaction that does not grow across later snapshots can be filtered as low-growth or trend-stale when comments remain low.
+- Initial interaction that does not grow fast enough across later snapshots can be filtered as low-growth, slow-growth, or trend-stale when comments remain low.
 
 ## JD Handling
 
@@ -120,4 +122,4 @@ Note: `actions/cache` is not a fully reliable mutable database store. Closely sp
 - `candidate_snapshots` stores near-real-time interaction counts so later runs can identify warming deals and stalled suspicious deals.
 - External comment/detail requests are throttled with random delays.
 - WAF-like responses (`202`, `403`, `429`, captcha markers, `probe.js`, access-frequency text) suspend external checks for the rest of the current run.
-- Notification content includes score tag, price, score rate, engagement numbers, trend growth, comment coverage, comment level stats when available, price-drop notes, and the SMZDM detail link.
+- Notification content includes score tag, price, score rate, engagement numbers, trend growth, comment coverage, comment level stats when available, price-drop notes, and the SMZDM detail link. Very long trend windows are not shown as cumulative growth; the notification only shows recent-run growth for old snapshots.
