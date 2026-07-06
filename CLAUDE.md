@@ -51,7 +51,7 @@ Basic signal requirement:
 
 There is no broad title keyword or category/tag hard exclusion. Carrier cards, coupons, red packets, finance, and similar content should generally be blocked downstream by WXPusher keyword rules if desired.
 
-The script does include narrow regex title blocking for task-like Jingdou posts that WXPusher keyword matching cannot express, especially the `入会...京豆` pattern and common variants such as `关注...1豆`, `签到...京豆`, and `得10京豆`.
+The script does include narrow regex title blocking for task-like Jingdou posts that WXPusher keyword matching cannot express, especially the `入会...京豆` pattern and common variants such as `入会5豆`, `关注...1豆`, `关注领京豆`, `签到100豆`, `抽奖50豆`, and `竞猜瓜分2万京豆`.
 
 ## Comment-Level Logic
 
