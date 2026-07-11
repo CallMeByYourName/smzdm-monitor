@@ -31,6 +31,10 @@ class SmzdmFilterTests(unittest.TestCase):
             "巴布豆 儿童运动鞋",
             "九阳 豆浆机 1.2L",
             "雅漾 祛痘舒缓小黑膜面膜5片*3盒",
+            "老板 天空之境系列 W76-F80D 独嵌两用洗碗机 15套",
+            "长虹 75D66H 144Hz高刷 4K平板液晶电视机",
+            "容声 BCD-515D30FNLBD 一级能效变频风冷冰箱",
+            "厨邦 特级鲜生抽1.06kg*2 黄豆酿造酱油",
         ]
         for title in titles:
             with self.subTest(title=title):
