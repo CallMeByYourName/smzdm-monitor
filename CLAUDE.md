@@ -38,11 +38,11 @@ The script is single-run mode: scan once -> filter -> push -> exit. There is no 
 Stage 1 has six acceptance paths:
 
 - `超级好价`: comments >= 20, worthy >= 20, collection >= 10, composite score >= 120, score rate >= 90%.
-- `均衡热度`: total engagement >= 15, composite score >= 45, score rate >= 70%.
-- `高讨论`: comments >= 8, total engagement >= 20, composite score >= 70, score rate >= 70%.
-- `早期好价`: worthy >= 4, comments >= 3, total engagement >= 12, composite score >= 25, score rate >= 90%.
-- `早期强信号`: worthy >= 4, collection >= 5, total engagement >= 10, composite score >= 22, score rate >= 95%. This path exists for comment-review delay and does not require comments >= 3.
-- `升温好价`: near-threshold current interaction plus meaningful growth in stored candidate snapshots.
+- `均衡热度`: comments >= 6, worthy >= 8, collection >= 5, total engagement >= 25, composite score >= 65, score rate >= 90%.
+- `高讨论`: comments >= 12, worthy >= 8, collection >= 5, total engagement >= 30, composite score >= 90, score rate >= 85%.
+- `早期好价`: worthy >= 4, comments >= 6, collection >= 4, total engagement >= 16, composite score >= 35, score rate >= 95%, followed by trend confirmation unless already strong.
+- `早期强信号`: worthy >= 6, collection >= 8, total engagement >= 16, composite score >= 28, score rate >= 95%, followed by worthy/collection growth confirmation.
+- `升温好价`: worthy >= 4, collection >= 4, total engagement >= 15, composite score >= 32, score rate >= 95%, plus fresh growth that includes worthy or collection growth.
 
 Basic signal requirement:
 
@@ -59,8 +59,8 @@ Candidate snapshots are stored in SQLite `candidate_snapshots` for 2 days. The s
 
 Trend data is also a filter:
 
-- Low-confidence early deals on `早期好价` or `早期强信号` wait for one later run when there is no prior snapshot and both comments and composite score are still modest.
-- `升温好价` requires fresh growth: either recent-run growth with enough speed, or cumulative growth inside a short window with enough per-hour growth. Old 1200-minute cumulative growth should not create a warming deal.
+- Low-confidence early deals on `早期好价` or `早期强信号` wait until a later run has meaningful growth that includes worthy or collection growth. A snapshot by itself is not confirmation.
+- `升温好价` requires fresh growth that includes worthy/collection growth. Comment-only growth and old cumulative growth must not create a warming deal.
 - Non-exempt deals with at least one prior snapshot are filtered as low-growth if they have been observed for about 25 minutes, still have few comments, and both total and recent growth scores are weak.
 - Deals with a long observation window, low comments, little recent growth, and weak cumulative growth speed are filtered as slow-growth.
 - `超级好价` and `高讨论` are exempt from the low-growth and slow-growth filters.
@@ -106,7 +106,7 @@ The old JD self-check helpers remain in the code behind `jd_self_filter_enabled`
 
 `.github/workflows/smzdm.yml`:
 
-- Runs every 30 minutes via GitHub schedule.
+- Triggered every 30 minutes by cron-job.org. GitHub schedule is intentionally disabled to avoid duplicate timers.
 - Supports manual `workflow_dispatch`.
 - Supports `repository_dispatch` for external cron-job.org triggers.
 - Persists `smzdm.db` with `actions/cache`.

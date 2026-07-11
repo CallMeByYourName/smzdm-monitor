@@ -36,24 +36,30 @@ CONFIG = {
         "collection": 2,                # 收藏权重中等
         "worthy": 1,                    # 值权重最低（最易刷）
     },
-    "min_total_engagement": 15,         # 基础门槛：评论+收藏+值 >= 15
-    "min_composite_score": 45,          # 综合评分阈值 (略微调高防止低质推送)
-    "min_score_rate": 70,               # 均衡路径好评率
-    "min_score_rate_relaxed": 70,        # 高讨论路径也要求较高好评率，避免推送争议商品
+    "min_total_engagement": 25,         # 均衡路径需要成熟、分布较完整的互动
+    "min_composite_score": 65,
+    "min_score_rate": 90,
+    "min_balanced_comments": 6,
+    "min_balanced_collection": 5,
+    "min_balanced_worthy": 8,
+    "min_score_rate_relaxed": 85,       # 高讨论路径仍要求较高好评率
     "min_signal_worthy": 2,              # 至少有值票或评论信号，避免纯收藏/纯券活动
     "min_signal_comments": 2,
-    "discussion_min_comments": 8,        # 高讨论路径：评论多、互动强，但仍要求较高好评率
-    "discussion_min_total_engagement": 20,
-    "discussion_min_composite_score": 70,
-    "emerging_min_worthy": 4,            # 早期好价路径：低评论但值票/收藏快速增长
-    "emerging_min_comments": 3,
-    "emerging_min_total_engagement": 12,
-    "emerging_min_composite_score": 25,
-    "emerging_min_score_rate": 90,
-    "early_signal_min_worthy": 4,        # 评论审核延迟时，允许低评论但收藏/值票同步增长的早期强信号
-    "early_signal_min_collection": 5,
-    "early_signal_min_total_engagement": 10,
-    "early_signal_min_composite_score": 22,
+    "discussion_min_comments": 12,
+    "discussion_min_collection": 5,
+    "discussion_min_worthy": 8,
+    "discussion_min_total_engagement": 30,
+    "discussion_min_composite_score": 90,
+    "emerging_min_worthy": 4,            # 早期好价必须有评论、收藏和值票三类信号
+    "emerging_min_comments": 6,
+    "emerging_min_collection": 4,
+    "emerging_min_total_engagement": 16,
+    "emerging_min_composite_score": 35,
+    "emerging_min_score_rate": 95,
+    "early_signal_min_worthy": 6,        # 评论审核延迟时，要求更强的收藏/值票组合
+    "early_signal_min_collection": 8,
+    "early_signal_min_total_engagement": 16,
+    "early_signal_min_composite_score": 28,
     "early_signal_min_score_rate": 95,
     "super_deal_min_comments": 20,       # 超级好价：高值率、高评论、高收藏和值票
     "super_deal_min_worthy": 20,
@@ -61,13 +67,16 @@ CONFIG = {
     "super_deal_min_composite_score": 120,
     "super_deal_min_score_rate": 90,
     "warming_min_growth_score": 10,      # 升温好价：依赖多轮扫描中的真实增长
-    "warming_min_composite_score": 24,
-    "warming_min_total_engagement": 10,
-    "warming_min_score_rate": 90,
-    "warming_recent_min_growth_score": 6,
+    "warming_min_worthy": 4,
+    "warming_min_collection": 4,
+    "warming_min_composite_score": 32,
+    "warming_min_total_engagement": 15,
+    "warming_min_score_rate": 95,
+    "warming_recent_min_growth_score": 8,
     "warming_recent_max_minutes": 120,
     "warming_cumulative_max_minutes": 180,
     "warming_min_growth_per_hour": 6,
+    "warming_min_signal_growth_score": 5,  # 升温必须包含值票/收藏增长，不能只靠评论
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -144,8 +153,13 @@ CONFIG = {
     "trend_stale_max_comments": 5,
     "trend_confirmation_enabled": True,       # 低信心早期商品先等一轮趋势确认
     "trend_confirmation_paths": ["早期好价", "早期强信号"],
-    "trend_confirmation_min_comments": 6,
-    "trend_confirmation_min_score": 35,
+    "trend_confirmation_min_comments": 10,
+    "trend_confirmation_min_score": 55,
+    "trend_confirmation_min_worthy": 8,
+    "trend_confirmation_min_collection": 6,
+    "trend_confirmation_min_growth_score": 8,
+    "trend_confirmation_min_signal_growth_score": 5,
+    "trend_confirmation_min_growth_per_hour": 6,
     "trend_low_growth_filter_enabled": True,  # 有历史快照但增长很慢时过滤
     "trend_low_growth_min_age_minutes": 25,
     "trend_low_growth_min_growth_score": 6,
@@ -162,6 +176,11 @@ CONFIG = {
 
     # 标题正则过滤：补齐 WXPusher 只能关键词屏蔽、无法表达“入会%京豆”的限制
     "title_block_patterns": [
+        r"(?:关注|入会|加入(?:店铺)?会员|签到|打卡|抽奖|大转盘|竞猜|瓜分|逛店|浏览任务)",
+        r"(?:店铺|旗舰店|直播间?|会员).{0,20}(?:领|抽|得|送|返|奖励|福利).{0,20}(?:\d|豆|逗|京豆|红包|券|积分|[dD](?![a-z]))",
+        r"(?:店铺|旗舰店|直播间?).{0,20}(?:领|抽|得|送|返).{0,12}\d+",
+        r"(?:京东|店铺|直播间?).{0,20}\d+\s*(?:京?豆|逗|[dD](?![a-z]))",
+        r"(?:领|得|送|返|抽).{0,20}(?:\d+|[零一二两三四五六七八九十百]+).{0,6}(?:京?豆|逗|[dD](?![a-z]))",
         r"入会.{0,40}京豆",
         r"入会.{0,30}\d+\s*(?:京豆|豆(?![\u4e00-\u9fff]))",
         r"关注.{0,30}\d+\s*(?:京豆|豆(?![\u4e00-\u9fff]))",
@@ -258,6 +277,8 @@ class SmzdmScraper:
         self.jd_self_check_limit = CONFIG['jd_self_check_min_per_run']
         self.jd_fetch_debug = []
         self.jd_page_checks_unavailable = False
+        self.quality_path_pass_counts = {}
+        self.quality_path_sent_counts = {}
         self.comment_level_checks = 0
         self.comment_level_check_limit = CONFIG['comment_level_check_min_per_run']
         self.external_checks_suspended = False
@@ -469,7 +490,9 @@ class SmzdmScraper:
                     f"[等待趋势确认] {parsed['title'][:40]}... | "
                     f"路径:{parsed.get('quality_path')} 评分:{parsed.get('composite_score', 0)} "
                     f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
-                    f"值:{parsed.get('worthy', 0)} 快照:{trend.get('snapshot_count', 0)}"
+                    f"值:{parsed.get('worthy', 0)} 快照:{trend.get('snapshot_count', 0)} "
+                    f"互动增长:{trend.get('recent_growth_score', 0)} "
+                    f"值藏增长:{trend.get('recent_signal_growth_score', 0)}"
                 )
                 continue
 
@@ -500,6 +523,8 @@ class SmzdmScraper:
                 self._save_history(parsed)
                 self._clear_pending_review(parsed)
                 self.stats['total_sent'] += 1
+                path = parsed.get('quality_path', '未知')
+                self.quality_path_sent_counts[path] = self.quality_path_sent_counts.get(path, 0) + 1
 
         self._print_statistics()
         self._cleanup()
@@ -789,6 +814,8 @@ class SmzdmScraper:
             'recent_delta_unworthy': recent_delta['unworthy'],
             'growth_score': growth_score,
             'recent_growth_score': recent_growth_score,
+            'signal_growth_score': self._calculate_signal_growth_score(first_delta),
+            'recent_signal_growth_score': self._calculate_signal_growth_score(recent_delta),
             'growth_per_hour': growth_per_hour,
             'recent_growth_per_hour': recent_growth_per_hour,
         }
@@ -810,6 +837,8 @@ class SmzdmScraper:
             'recent_delta_unworthy': 0,
             'growth_score': 0,
             'recent_growth_score': 0,
+            'signal_growth_score': 0,
+            'recent_signal_growth_score': 0,
             'growth_per_hour': 0,
             'recent_growth_per_hour': 0,
         }
@@ -851,6 +880,15 @@ class SmzdmScraper:
             + delta['collection'] * weights['collection']
             + delta['worthy'] * weights['worthy']
             + delta['unworthy'] * weights['unworthy']
+        )
+
+    @staticmethod
+    def _calculate_signal_growth_score(delta):
+        """Only count purchase-intent signals; comments alone cannot confirm warming."""
+        weights = CONFIG['trend_weights']
+        return (
+            delta['collection'] * weights['collection']
+            + delta['worthy'] * weights['worthy']
         )
 
     def _save_candidate_snapshot(self, parsed):
@@ -930,7 +968,7 @@ class SmzdmScraper:
         weights = CONFIG['score_weights']
         return {
             'total_engagement': comments + collection + worthy,
-            'score_rate': round(worthy / total_votes * 100) if total_votes > 0 else 100,
+            'score_rate': round(worthy / total_votes * 100) if total_votes > 0 else 0,
             'composite_score': (
                 comments * weights['comments']
                 + collection * weights['collection']
@@ -941,7 +979,9 @@ class SmzdmScraper:
     # ==================== 筛选 ====================
 
     def _is_title_blocked(self, parsed):
-        text = f"{parsed.get('mall', '')} {parsed.get('title', '')}"
+        text = self._normalize_task_title(
+            f"{parsed.get('mall', '')} {parsed.get('title', '')}"
+        )
         for pattern in CONFIG.get('title_block_patterns', []):
             if re.search(pattern, text, flags=re.IGNORECASE):
                 parsed['blocked_title_pattern'] = pattern
@@ -953,18 +993,60 @@ class SmzdmScraper:
         return False
 
     @staticmethod
+    def _normalize_task_title(value):
+        """Normalize common reward-title obfuscation before applying task rules."""
+        text = str(value or '').translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+        text = text.replace('\ufe0f', '').replace('\u20e3', '')
+        text = re.sub(r'[①❶➀]', '1', text)
+        text = re.sub(r'[②❷➁]', '2', text)
+        text = re.sub(r'[③❸➂]', '3', text)
+        text = re.sub(r'[④❹➃]', '4', text)
+        text = re.sub(r'[⑤❺➄]', '5', text)
+        text = re.sub(r'[⑥❻➅]', '6', text)
+        text = re.sub(r'[⑦❼➆]', '7', text)
+        text = re.sub(r'[⑧❽➇]', '8', text)
+        text = re.sub(r'[⑨❾➈]', '9', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    @staticmethod
     def _should_wait_for_trend_confirmation(parsed):
         if not CONFIG.get('trend_confirmation_enabled'):
             return False
         if parsed.get('quality_path') not in CONFIG.get('trend_confirmation_paths', []):
             return False
         trend = parsed.get('trend_metrics') or {}
-        if trend.get('snapshot_count', 0) > 0:
-            return False
-        return (
-            parsed.get('comments', 0) < CONFIG['trend_confirmation_min_comments']
-            and parsed.get('composite_score', 0) < CONFIG['trend_confirmation_min_score']
+        strong_now = (
+            parsed.get('comments', 0) >= CONFIG['trend_confirmation_min_comments']
+            and parsed.get('composite_score', 0) >= CONFIG['trend_confirmation_min_score']
+            and parsed.get('worthy', 0) >= CONFIG['trend_confirmation_min_worthy']
+            and parsed.get('collection', 0) >= CONFIG['trend_confirmation_min_collection']
         )
+        if strong_now:
+            return False
+        return not SmzdmScraper._has_confirmed_early_trend(trend)
+
+    @staticmethod
+    def _has_confirmed_early_trend(trend):
+        if trend.get('snapshot_count', 0) <= 0:
+            return False
+        recent_ok = (
+            trend.get('recent_minutes', 0) <= CONFIG['warming_recent_max_minutes']
+            and trend.get('recent_growth_score', 0) >= CONFIG['trend_confirmation_min_growth_score']
+            and trend.get('recent_signal_growth_score', 0)
+            >= CONFIG['trend_confirmation_min_signal_growth_score']
+            and trend.get('recent_growth_per_hour', 0)
+            >= CONFIG['trend_confirmation_min_growth_per_hour']
+        )
+        cumulative_ok = (
+            trend.get('elapsed_minutes', 0) <= CONFIG['warming_cumulative_max_minutes']
+            and trend.get('growth_score', 0) >= CONFIG['trend_confirmation_min_growth_score']
+            and trend.get('signal_growth_score', 0)
+            >= CONFIG['trend_confirmation_min_signal_growth_score']
+            and trend.get('growth_per_hour', 0)
+            >= CONFIG['trend_confirmation_min_growth_per_hour']
+        )
+        return recent_ok or cumulative_ok
 
     @staticmethod
     def _is_low_growth_candidate(parsed):
@@ -1013,6 +1095,8 @@ class SmzdmScraper:
             return False
         return (
             trend.get('recent_growth_score', 0) >= CONFIG['warming_recent_min_growth_score']
+            and trend.get('recent_signal_growth_score', 0)
+            >= CONFIG['warming_min_signal_growth_score']
             and trend.get('recent_growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
         )
 
@@ -1024,6 +1108,7 @@ class SmzdmScraper:
             return False
         return (
             trend.get('growth_score', 0) >= CONFIG['warming_min_growth_score']
+            and trend.get('signal_growth_score', 0) >= CONFIG['warming_min_signal_growth_score']
             and trend.get('growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
         )
 
@@ -1076,16 +1161,22 @@ class SmzdmScraper:
                 and score_rate >= CONFIG['super_deal_min_score_rate']):
             quality_path = '超级好价'
         elif (comments >= CONFIG['discussion_min_comments']
+              and worthy >= CONFIG['discussion_min_worthy']
+              and collection >= CONFIG['discussion_min_collection']
               and total_engagement >= CONFIG['discussion_min_total_engagement']
               and composite_score >= CONFIG['discussion_min_composite_score']
               and score_rate >= CONFIG['min_score_rate_relaxed']):
             quality_path = '高讨论'
-        elif (total_engagement >= CONFIG['min_total_engagement']
+        elif (comments >= CONFIG['min_balanced_comments']
+                and worthy >= CONFIG['min_balanced_worthy']
+                and collection >= CONFIG['min_balanced_collection']
+                and total_engagement >= CONFIG['min_total_engagement']
                 and composite_score >= CONFIG['min_composite_score']
                 and score_rate >= CONFIG['min_score_rate']):
             quality_path = '均衡热度'
         elif (worthy >= CONFIG['emerging_min_worthy']
               and comments >= CONFIG['emerging_min_comments']
+              and collection >= CONFIG['emerging_min_collection']
               and total_engagement >= CONFIG['emerging_min_total_engagement']
               and composite_score >= CONFIG['emerging_min_composite_score']
               and score_rate >= CONFIG['emerging_min_score_rate']):
@@ -1097,6 +1188,8 @@ class SmzdmScraper:
               and score_rate >= CONFIG['early_signal_min_score_rate']):
             quality_path = '早期强信号'
         elif (trend.get('snapshot_count', 0) > 0
+              and worthy >= CONFIG['warming_min_worthy']
+              and collection >= CONFIG['warming_min_collection']
               and total_engagement >= CONFIG['warming_min_total_engagement']
               and composite_score >= CONFIG['warming_min_composite_score']
               and score_rate >= CONFIG['warming_min_score_rate']
@@ -1112,11 +1205,14 @@ class SmzdmScraper:
         parsed['trend_score'] = effective_trend_score
         parsed['deal_score'] = composite_score + effective_trend_score
         parsed['quality_path'] = quality_path
+        self.quality_path_pass_counts[quality_path] = self.quality_path_pass_counts.get(quality_path, 0) + 1
 
         logging.info(
             f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
             f"评分:{composite_score} 有效增长:{effective_trend_score} "
             f"累计:{growth_score} 近期:{recent_growth_score} "
+            f"值藏增长:{trend.get('signal_growth_score', 0)}/"
+            f"{trend.get('recent_signal_growth_score', 0)} "
             f"速率:{trend.get('growth_per_hour', 0)}/h 好评率:{parsed['score_rate']}% "
             f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
@@ -1130,7 +1226,7 @@ class SmzdmScraper:
         total_votes = worthy + unworthy
         metrics = self._current_interaction_metrics(parsed)
 
-        parsed['score_rate'] = metrics['score_rate'] if total_votes > 0 else 100
+        parsed['score_rate'] = metrics['score_rate'] if total_votes > 0 else 0
         parsed['composite_score'] = metrics['composite_score']
         trend_score = self._effective_trend_score(parsed.get('trend_metrics') or {})
         parsed['trend_score'] = trend_score
@@ -2682,6 +2778,12 @@ class SmzdmScraper:
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  标题正则过滤: {self.stats['total_filtered_title_pattern']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
+        if self.quality_path_pass_counts:
+            path_summary = ", ".join(
+                f"{path}:{count}"
+                for path, count in sorted(self.quality_path_pass_counts.items())
+            )
+            logging.info(f"  初筛路径分布: {path_summary}")
         logging.info(f"  等待趋势确认: {self.stats['total_deferred_trend_confirmation']}")
         logging.info(f"  京东非自营过滤: {self.stats['total_filtered_jd_self']}")
         if CONFIG['jd_self_filter_enabled']:
@@ -2705,6 +2807,12 @@ class SmzdmScraper:
         logging.info(f"  增长过慢过滤: {self.stats['total_filtered_trend_slow']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
+        if self.quality_path_sent_counts:
+            sent_summary = ", ".join(
+                f"{path}:{count}"
+                for path, count in sorted(self.quality_path_sent_counts.items())
+            )
+            logging.info(f"  推送路径分布: {sent_summary}")
         logging.info("=" * 50)
 
     def _cleanup(self):

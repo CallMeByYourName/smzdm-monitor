@@ -1,11 +1,10 @@
 name: SMZDM 好价监控 NEW
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch: # 保留它
+  # 由 cron-job.org 每 30 分钟触发。不要再叠加 GitHub schedule，避免重复扫描。
+  workflow_dispatch:
   repository_dispatch:
-    types: [cron_trigger] # 自定义一个事件名称
+    types: [cron_trigger]
 
 concurrency:
   group: smzdm-scan
