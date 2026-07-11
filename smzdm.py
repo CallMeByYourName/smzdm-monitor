@@ -77,6 +77,7 @@ CONFIG = {
     "warming_cumulative_max_minutes": 180,
     "warming_min_growth_per_hour": 6,
     "warming_min_signal_growth_score": 5,  # 升温必须包含值票/收藏增长，不能只靠评论
+    "warming_min_worthy_growth": 1,       # 收藏增长可刷，至少还要出现真实值票增长
     "excluded_status_keywords": [
         "售罄",
         "过期",
@@ -159,6 +160,7 @@ CONFIG = {
     "trend_confirmation_min_collection": 6,
     "trend_confirmation_min_growth_score": 8,
     "trend_confirmation_min_signal_growth_score": 5,
+    "trend_confirmation_min_worthy_growth": 1,
     "trend_confirmation_min_growth_per_hour": 6,
     "trend_low_growth_filter_enabled": True,  # 有历史快照但增长很慢时过滤
     "trend_low_growth_min_age_minutes": 25,
@@ -193,7 +195,7 @@ CONFIG = {
     ],
 
     # 去重参数
-    "fingerprint_dedupe_days": 3,       # 同商品标题指纹在 N 天内只推一次
+    "fingerprint_dedupe_days": 30,      # 同商品 30 天内不重复；真实降价仍可再次推送
     "fingerprint_min_len": 8,
     "price_drop_min_percent": 5,        # 同商品降价超过 5% 允许再次推送
     "price_drop_min_amount": 5,         # 或至少便宜 5 元允许再次推送
@@ -492,7 +494,8 @@ class SmzdmScraper:
                     f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                     f"值:{parsed.get('worthy', 0)} 快照:{trend.get('snapshot_count', 0)} "
                     f"互动增长:{trend.get('recent_growth_score', 0)} "
-                    f"值藏增长:{trend.get('recent_signal_growth_score', 0)}"
+                    f"值增长:{trend.get('recent_delta_worthy', 0)} "
+                    f"收藏增长:{trend.get('recent_delta_collection', 0)}"
                 )
                 continue
 
@@ -1035,6 +1038,8 @@ class SmzdmScraper:
             and trend.get('recent_growth_score', 0) >= CONFIG['trend_confirmation_min_growth_score']
             and trend.get('recent_signal_growth_score', 0)
             >= CONFIG['trend_confirmation_min_signal_growth_score']
+            and trend.get('recent_delta_worthy', 0)
+            >= CONFIG['trend_confirmation_min_worthy_growth']
             and trend.get('recent_growth_per_hour', 0)
             >= CONFIG['trend_confirmation_min_growth_per_hour']
         )
@@ -1043,6 +1048,8 @@ class SmzdmScraper:
             and trend.get('growth_score', 0) >= CONFIG['trend_confirmation_min_growth_score']
             and trend.get('signal_growth_score', 0)
             >= CONFIG['trend_confirmation_min_signal_growth_score']
+            and trend.get('delta_worthy', 0)
+            >= CONFIG['trend_confirmation_min_worthy_growth']
             and trend.get('growth_per_hour', 0)
             >= CONFIG['trend_confirmation_min_growth_per_hour']
         )
@@ -1097,6 +1104,7 @@ class SmzdmScraper:
             trend.get('recent_growth_score', 0) >= CONFIG['warming_recent_min_growth_score']
             and trend.get('recent_signal_growth_score', 0)
             >= CONFIG['warming_min_signal_growth_score']
+            and trend.get('recent_delta_worthy', 0) >= CONFIG['warming_min_worthy_growth']
             and trend.get('recent_growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
         )
 
@@ -1109,6 +1117,7 @@ class SmzdmScraper:
         return (
             trend.get('growth_score', 0) >= CONFIG['warming_min_growth_score']
             and trend.get('signal_growth_score', 0) >= CONFIG['warming_min_signal_growth_score']
+            and trend.get('delta_worthy', 0) >= CONFIG['warming_min_worthy_growth']
             and trend.get('growth_per_hour', 0) >= CONFIG['warming_min_growth_per_hour']
         )
 
@@ -1211,8 +1220,10 @@ class SmzdmScraper:
             f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
             f"评分:{composite_score} 有效增长:{effective_trend_score} "
             f"累计:{growth_score} 近期:{recent_growth_score} "
-            f"值藏增长:{trend.get('signal_growth_score', 0)}/"
-            f"{trend.get('recent_signal_growth_score', 0)} "
+            f"值增长:{trend.get('delta_worthy', 0)}/"
+            f"{trend.get('recent_delta_worthy', 0)} "
+            f"收藏增长:{trend.get('delta_collection', 0)}/"
+            f"{trend.get('recent_delta_collection', 0)} "
             f"速率:{trend.get('growth_per_hour', 0)}/h 好评率:{parsed['score_rate']}% "
             f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )

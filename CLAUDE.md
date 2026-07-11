@@ -42,7 +42,7 @@ Stage 1 has six acceptance paths:
 - `高讨论`: comments >= 12, worthy >= 8, collection >= 5, total engagement >= 30, composite score >= 90, score rate >= 85%.
 - `早期好价`: worthy >= 4, comments >= 6, collection >= 4, total engagement >= 16, composite score >= 35, score rate >= 95%, followed by trend confirmation unless already strong.
 - `早期强信号`: worthy >= 6, collection >= 8, total engagement >= 16, composite score >= 28, score rate >= 95%, followed by worthy/collection growth confirmation.
-- `升温好价`: worthy >= 4, collection >= 4, total engagement >= 15, composite score >= 32, score rate >= 95%, plus fresh growth that includes worthy or collection growth.
+- `升温好价`: worthy >= 4, collection >= 4, total engagement >= 15, composite score >= 32, score rate >= 95%, plus fresh growth that includes at least one new worthy vote.
 
 Basic signal requirement:
 
@@ -59,8 +59,8 @@ Candidate snapshots are stored in SQLite `candidate_snapshots` for 2 days. The s
 
 Trend data is also a filter:
 
-- Low-confidence early deals on `早期好价` or `早期强信号` wait until a later run has meaningful growth that includes worthy or collection growth. A snapshot by itself is not confirmation.
-- `升温好价` requires fresh growth that includes worthy/collection growth. Comment-only growth and old cumulative growth must not create a warming deal.
+- Low-confidence early deals on `早期好价` or `早期强信号` wait until a later run has meaningful growth that includes at least one new worthy vote. A snapshot or collection-only growth is not confirmation.
+- `升温好价` requires fresh growth that includes at least one new worthy vote. Comment-only, collection-only, and old cumulative growth must not create a warming deal.
 - Non-exempt deals with at least one prior snapshot are filtered as low-growth if they have been observed for about 25 minutes, still have few comments, and both total and recent growth scores are weak.
 - Deals with a long observation window, low comments, little recent growth, and weak cumulative growth speed are filtered as slow-growth.
 - `超级好价` and `高讨论` are exempt from the low-growth and slow-growth filters.
@@ -98,7 +98,7 @@ The old JD self-check helpers remain in the code behind `jd_self_filter_enabled`
 - Only successfully pushed deals are saved to `history`.
 - Same article ID is skipped after being saved.
 - Same platform SKU key is skipped when channel APIs expose `article_mall_client.product_no`.
-- Similar title fingerprints are deduped for 3 days.
+- Similar title fingerprints are deduped for 30 days.
 - Same SKU or fingerprint can be pushed again if the new price is at least 5 RMB lower or at least 5% lower than the previous pushed minimum.
 - Filtered or failed-push deals are not written to `history`, so later scans can reevaluate them with newer data and candidate snapshots.
 

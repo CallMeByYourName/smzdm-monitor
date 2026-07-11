@@ -62,6 +62,26 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertFalse(self.scraper._has_warming_trend(trend))
         self.assertFalse(self.scraper._has_confirmed_early_trend(trend))
 
+    def test_collection_only_growth_cannot_confirm_warming(self):
+        trend = self.scraper._empty_trend_metrics()
+        trend.update({
+            "snapshot_count": 2,
+            "recent_minutes": 30,
+            "elapsed_minutes": 60,
+            "recent_growth_score": 16,
+            "growth_score": 20,
+            "recent_signal_growth_score": 16,
+            "signal_growth_score": 20,
+            "recent_delta_collection": 8,
+            "delta_collection": 10,
+            "recent_delta_worthy": 0,
+            "delta_worthy": 0,
+            "recent_growth_per_hour": 32,
+            "growth_per_hour": 20,
+        })
+        self.assertFalse(self.scraper._has_warming_trend(trend))
+        self.assertFalse(self.scraper._has_confirmed_early_trend(trend))
+
     def test_worthy_and_collection_growth_confirms_trend(self):
         trend = self.scraper._empty_trend_metrics()
         trend.update({
@@ -72,6 +92,8 @@ class SmzdmFilterTests(unittest.TestCase):
             "growth_score": 13,
             "recent_signal_growth_score": 5,
             "signal_growth_score": 5,
+            "recent_delta_worthy": 1,
+            "delta_worthy": 1,
             "recent_growth_per_hour": 26,
             "growth_per_hour": 13,
         })
@@ -102,6 +124,8 @@ class SmzdmFilterTests(unittest.TestCase):
             "growth_score": 20,
             "recent_signal_growth_score": 7,
             "signal_growth_score": 9,
+            "recent_delta_worthy": 1,
+            "delta_worthy": 2,
             "recent_growth_per_hour": 30,
             "growth_per_hour": 20,
         })
