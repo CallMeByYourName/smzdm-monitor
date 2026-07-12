@@ -155,9 +155,13 @@ CONFIG = {
     "trend_confirmation_enabled": True,       # 低信心早期商品先等一轮趋势确认
     "trend_confirmation_paths": ["早期好价", "早期强信号"],
     "trend_confirmation_min_comments": 10,
-    "trend_confirmation_min_score": 55,
-    "trend_confirmation_min_worthy": 8,
-    "trend_confirmation_min_collection": 6,
+    "trend_confirmation_min_score": 65,
+    "trend_confirmation_min_worthy": 6,
+    "trend_confirmation_min_collection": 8,
+    "trend_confirmation_discussion_min_comments": 20,
+    "trend_confirmation_discussion_min_score": 100,
+    "trend_confirmation_discussion_min_worthy": 4,
+    "trend_confirmation_discussion_min_collection": 8,
     "trend_confirmation_min_growth_score": 8,
     "trend_confirmation_min_signal_growth_score": 5,
     "trend_confirmation_min_worthy_growth": 1,
@@ -192,6 +196,11 @@ CONFIG = {
         r"(?:领|得|送|返|抽).{0,30}\d+\s*京豆",
         r"(?:竞猜|瓜分).{0,30}\d+\s*万?\s*京豆",
         r"\d+\s*万?\s*京豆",
+        # 店铺名后只有操作、奖励或含糊数量，不是可购买商品标题。
+        r"(?:旗舰店|专营店|专卖店|店铺).{0,24}(?:加购(?:\s*如图)?|如图)\s*$",
+        r"(?:旗舰店|专营店|专卖店|店铺).{0,24}共计.{0,12}(?:个?豆|京豆)",
+        r"(?:旗舰店|专营店|专卖店|店铺).{0,12}有\s*(?:\d[\d\s]*|[零一二两三四五六七八九十百]+)\s*$",
+        r"(?:^|\s)来来来.{0,12}(?:一百|100)的?\s*$",
     ],
 
     # 去重参数
@@ -1019,13 +1028,19 @@ class SmzdmScraper:
         if parsed.get('quality_path') not in CONFIG.get('trend_confirmation_paths', []):
             return False
         trend = parsed.get('trend_metrics') or {}
-        strong_now = (
+        balanced_now = (
             parsed.get('comments', 0) >= CONFIG['trend_confirmation_min_comments']
             and parsed.get('composite_score', 0) >= CONFIG['trend_confirmation_min_score']
             and parsed.get('worthy', 0) >= CONFIG['trend_confirmation_min_worthy']
             and parsed.get('collection', 0) >= CONFIG['trend_confirmation_min_collection']
         )
-        if strong_now:
+        discussion_now = (
+            parsed.get('comments', 0) >= CONFIG['trend_confirmation_discussion_min_comments']
+            and parsed.get('composite_score', 0) >= CONFIG['trend_confirmation_discussion_min_score']
+            and parsed.get('worthy', 0) >= CONFIG['trend_confirmation_discussion_min_worthy']
+            and parsed.get('collection', 0) >= CONFIG['trend_confirmation_discussion_min_collection']
+        )
+        if balanced_now or discussion_now:
             return False
         return not SmzdmScraper._has_confirmed_early_trend(trend)
 

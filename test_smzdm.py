@@ -19,6 +19,10 @@ class SmzdmFilterTests(unittest.TestCase):
             "加州宝宝海外京东自营关注领五；豆",
             "S图伦JD旗舰店关注45D",
             "金融汇添抽奖88，大概率",
+            "京棟 河南首豫白酒专营店有2 0",
+            "京棟 礼来蓉城旗舰店 共计二十个豆",
+            "美士京东自营旗舰店 加购 如图",
+            "来来来这是一百的",
         ]
         for title in blocked_titles:
             with self.subTest(title=title):
@@ -35,6 +39,7 @@ class SmzdmFilterTests(unittest.TestCase):
             "长虹 75D66H 144Hz高刷 4K平板液晶电视机",
             "容声 BCD-515D30FNLBD 一级能效变频风冷冰箱",
             "厨邦 特级鲜生抽1.06kg*2 黄豆酿造酱油",
+            "小米京东自营旗舰店 加购价199元 智能空气炸锅 6L",
         ]
         for title in titles:
             with self.subTest(title=title):
@@ -130,6 +135,53 @@ class SmzdmFilterTests(unittest.TestCase):
             "growth_per_hour": 20,
         })
         self.assertFalse(self.scraper._should_wait_for_trend_confirmation(parsed))
+
+    def test_mature_balanced_early_deal_does_not_wait_for_recent_growth(self):
+        parsed = {
+            "title": "京东京造 男士复合维生素180片",
+            "comments": 10,
+            "collection": 20,
+            "worthy": 6,
+            "unworthy": 0,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": self.scraper._empty_trend_metrics(),
+        }
+        self.assertTrue(self.scraper._filter_stage1(parsed))
+        self.assertEqual(parsed["quality_path"], "早期好价")
+        self.assertFalse(self.scraper._should_wait_for_trend_confirmation(parsed))
+
+    def test_mature_discussion_deal_does_not_require_recent_worthy_growth(self):
+        parsed = {
+            "title": "崇鲜 挪威冰鲜三文鱼生鱼片350g",
+            "comments": 47,
+            "collection": 11,
+            "worthy": 4,
+            "unworthy": 0,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": self.scraper._empty_trend_metrics(),
+        }
+        self.assertTrue(self.scraper._filter_stage1(parsed))
+        self.assertEqual(parsed["quality_path"], "早期好价")
+        self.assertFalse(self.scraper._should_wait_for_trend_confirmation(parsed))
+
+    def test_high_comments_without_enough_collection_still_waits(self):
+        parsed = {
+            "title": "德路普 手机远程开关水阀",
+            "comments": 28,
+            "collection": 6,
+            "worthy": 4,
+            "unworthy": 0,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": self.scraper._empty_trend_metrics(),
+        }
+        self.assertTrue(self.scraper._filter_stage1(parsed))
+        self.assertTrue(self.scraper._should_wait_for_trend_confirmation(parsed))
 
 
 if __name__ == "__main__":
