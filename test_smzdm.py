@@ -40,6 +40,8 @@ class SmzdmFilterTests(unittest.TestCase):
             "容声 BCD-515D30FNLBD 一级能效变频风冷冰箱",
             "厨邦 特级鲜生抽1.06kg*2 黄豆酿造酱油",
             "小米京东自营旗舰店 加购价199元 智能空气炸锅 6L",
+            "PLUS会员：洁柔 抽纸缤纷系列原生木浆 3层 100抽*20包",
+            "1号会员店 尊享年卡送（2斤冷冻金枕榴莲+240枚鸡蛋）",
         ]
         for title in titles:
             with self.subTest(title=title):
