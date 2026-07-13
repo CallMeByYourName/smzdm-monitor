@@ -29,6 +29,10 @@ CONFIG = {
     "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 20,
+    "rank_source_enabled": True,       # 总榜补充会重新浮出超过 6 小时但近期升温的商品
+    "rank_source_url": "https://m.smzdm.com/sou/category_rank",
+    "rank_source_hour": 12,
+    "rank_source_limit": 20,           # 每轮只请求一次总榜，避免增加反爬压力
 
     # 第一阶段：综合评分筛选
     "score_weights": {
@@ -182,7 +186,9 @@ CONFIG = {
 
     # 标题正则过滤：补齐 WXPusher 只能关键词屏蔽、无法表达“入会%京豆”的限制
     "title_block_patterns": [
-        r"(?:关注|入会|加入(?:店铺)?会员|签到|打卡|抽奖|大转盘|竞猜|瓜分|逛店|浏览任务)",
+        r"(?:关注|入会|加入(?:店铺)?会员|签到|打卡|抽奖|大转盘|竞猜|瓜分|逛店|浏览任务).{0,40}(?:京豆|豆(?![\u4e00-\u9fff])|逗(?![\u4e00-\u9fff])|[dD](?![a-z])|红包|优惠券|积分|现金奖励|实测|大概率|必中)",
+        r"(?:评论|晒单|发布评论).{0,16}(?:有奖|赢|奖励|现金)",
+        r"(?:会员)?积分.{0,16}(?:兑换|换购).{0,16}(?:实物|礼品|商品)",
         r"(?:店铺|旗舰店|直播间?|会员).{0,20}(?:领|抽|得|送|返|奖励|福利).{0,20}(?:京豆|豆(?![\u4e00-\u9fff])|逗(?![\u4e00-\u9fff])|红包|优惠券|积分|[dD](?![a-z]))",
         r"(?:^|\s)(?:店铺|直播间?).{0,8}(?:领|抽|得|送|返).{0,4}\d+\s*$",
         r"(?:店铺|直播间?).{0,20}\d+\s*(?:京豆|豆(?![\u4e00-\u9fff])|逗(?![\u4e00-\u9fff]))",
@@ -249,6 +255,10 @@ class SmzdmScraper:
 
         self.stats = {
             'total_fetched': 0,
+            'total_rank_fetched': 0,
+            'total_rank_merged': 0,
+            'total_rank_candidates': 0,
+            'total_rank_unavailable': 0,
             'total_sent': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
@@ -545,6 +555,13 @@ class SmzdmScraper:
         """扫描 API 并通过综合评分筛选候选商品"""
         candidates = []
         stop_scanning = False
+        rank_rows = self._fetch_rank_rows()
+        rank_by_id = {
+            str(row.get('article_id', '')).strip(): (position, row)
+            for position, row in enumerate(rank_rows, start=1)
+            if str(row.get('article_id', '')).strip()
+        }
+        processed_ids = set()
 
         for page in range(1, CONFIG['max_pages'] + 1):
             if stop_scanning:
@@ -569,30 +586,145 @@ class SmzdmScraper:
                     stop_scanning = True
                     break
 
-                if self._is_duplicate(parsed):
-                    self.stats['total_duplicates'] += 1
-                    continue
-
-                self._attach_trend_metrics(parsed)
-                self._save_candidate_snapshot(parsed)
-
-                if self._is_title_blocked(parsed):
-                    self.stats['total_filtered_title_pattern'] += 1
-                    continue
-
-                # 第一阶段：综合评分筛选
-                if not self._filter_stage1(parsed):
-                    self.stats['total_filtered_stage1'] += 1
-                    continue
-
-                candidates.append(parsed)
-                self.seen_ids.add(parsed['id'])  # 立即标记，防止跨页重复
+                processed_ids.add(parsed['id'])
+                rank_entry = rank_by_id.get(parsed['id'])
+                if rank_entry:
+                    self._apply_rank_metrics(parsed, rank_entry[1], rank_entry[0])
+                    self.stats['total_rank_merged'] += 1
+                self._consider_stage1_candidate(parsed, candidates)
 
             self._commit_candidate_snapshots()
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
+        for position, row in enumerate(rank_rows, start=1):
+            article_id = str(row.get('article_id', '')).strip()
+            if not article_id or article_id in processed_ids:
+                continue
+            parsed = self._parse_rank_item(row, position)
+            if parsed:
+                self._consider_stage1_candidate(parsed, candidates)
+
         self._commit_candidate_snapshots()
         return candidates
+
+    def _consider_stage1_candidate(self, parsed, candidates):
+        if self._is_duplicate(parsed):
+            self.stats['total_duplicates'] += 1
+            return
+
+        self._attach_trend_metrics(parsed)
+        self._save_candidate_snapshot(parsed)
+
+        if self._is_title_blocked(parsed):
+            self.stats['total_filtered_title_pattern'] += 1
+            return
+
+        if not self._filter_stage1(parsed):
+            self.stats['total_filtered_stage1'] += 1
+            return
+
+        candidates.append(parsed)
+        self.seen_ids.add(parsed['id'])
+        if parsed.get('rank_source'):
+            self.stats['total_rank_candidates'] += 1
+            logging.info(
+                f"[排行榜候选 #{parsed.get('rank_position')}] {parsed['title'][:40]}... | "
+                f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
+            )
+
+    def _fetch_rank_rows(self):
+        if not CONFIG.get('rank_source_enabled'):
+            return []
+        try:
+            response = self.session.get(
+                CONFIG['rank_source_url'],
+                params={
+                    'page': 1,
+                    'limit': CONFIG['rank_source_limit'],
+                    'hour': CONFIG['rank_source_hour'],
+                },
+                headers={
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://m.smzdm.com/top/',
+                },
+                timeout=CONFIG['timeout'],
+            )
+            if response.status_code != 200:
+                self.stats['total_rank_unavailable'] += 1
+                logging.warning(f"排行榜补充不可用: HTTP {response.status_code}，继续主列表扫描")
+                return []
+            payload = response.json()
+            data = payload.get('data') if isinstance(payload, dict) else None
+            rows = data.get('rows') if isinstance(data, dict) else None
+            if str(payload.get('error_code')) != '0' or not isinstance(rows, list):
+                self.stats['total_rank_unavailable'] += 1
+                logging.warning("排行榜补充返回格式异常，继续主列表扫描")
+                return []
+            rows = rows[:CONFIG['rank_source_limit']]
+            self.stats['total_rank_fetched'] += len(rows)
+            logging.info(f"排行榜补充获取: {len(rows)} 条（{CONFIG['rank_source_hour']}小时总榜）")
+            return rows
+        except Exception as e:
+            self.stats['total_rank_unavailable'] += 1
+            logging.warning(f"排行榜补充请求异常: {e}，继续主列表扫描")
+            return []
+
+    def _parse_rank_item(self, row, position):
+        mapped = {
+            'article_id': row.get('article_id'),
+            'article_channel_type': row.get('article_channel_type') or 'youhui',
+            'article_title': row.get('article_title'),
+            'article_price': row.get('article_subtitle'),
+            'article_url': row.get('article_url'),
+            'article_format_date': row.get('article_date'),
+            'publish_date_lt': row.get('article_timesort'),
+            'article_mall': row.get('article_mall'),
+            'article_worthy': row.get('article_worthy'),
+            'article_unworthy': row.get('article_unworthy'),
+            'article_comment': row.get('article_comment'),
+            'article_is_sold_out': row.get('article_stock_status'),
+            'tongji_hudong': self._rank_tongji_hudong(row),
+        }
+        parsed = self._parse_item(mapped)
+        if parsed:
+            self._apply_rank_metrics(parsed, row, position)
+        return parsed
+
+    @staticmethod
+    def _rank_tongji_hudong(row):
+        return ','.join([
+            f"评论_{SmzdmScraper._safe_nonnegative_int(row.get('article_comment'))}",
+            f"收藏_{SmzdmScraper._safe_nonnegative_int(row.get('article_collection'))}",
+            f"值_{SmzdmScraper._safe_nonnegative_int(row.get('article_worthy'))}",
+            f"不值_{SmzdmScraper._safe_nonnegative_int(row.get('article_unworthy'))}",
+        ])
+
+    @staticmethod
+    def _safe_nonnegative_int(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _apply_rank_metrics(parsed, row, position):
+        metric_fields = {
+            'comments': 'article_comment',
+            'collection': 'article_collection',
+            'worthy': 'article_worthy',
+            'unworthy': 'article_unworthy',
+        }
+        for parsed_field, rank_field in metric_fields.items():
+            parsed[parsed_field] = max(
+                parsed.get(parsed_field, 0) or 0,
+                SmzdmScraper._safe_nonnegative_int(row.get(rank_field)),
+            )
+        parsed['rank_source'] = True
+        parsed['rank_position'] = position
+        parsed['rank_window_hours'] = CONFIG['rank_source_hour']
+        if not parsed.get('link'):
+            parsed['link'] = str(row.get('article_url') or '').strip()
 
     def _fetch_page(self, page):
         """获取列表页数据"""
@@ -757,6 +889,7 @@ class SmzdmScraper:
             text = text.replace(word, '')
 
         text = re.sub(r'\d+(\.\d+)?\s*元.*$', '', text)
+        text = re.sub(r'[（(](?:\d+色|多色|多款)可选[）)]', '', text)
         text = re.sub(r'[^\w\u4e00-\u9fff]+', '', text)
         if len(text) < CONFIG['fingerprint_min_len']:
             return ''
@@ -2482,6 +2615,7 @@ class SmzdmScraper:
         comment_module_coverage = data.get('comment_module_coverage') or {}
         trend = data.get('trend_metrics') or {}
         price_drop_note = data.get('price_drop_note')
+        rank_position = data.get('rank_position')
 
         if data.get('quality_path') == '超级好价':
             score_tag = '💎超'
@@ -2558,6 +2692,12 @@ class SmzdmScraper:
         price_drop_line = ''
         if price_drop_note:
             price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
+        rank_line = ''
+        if rank_position:
+            rank_line = (
+                f"🏆 来源：{int(data.get('rank_window_hours') or 12)}小时热榜 "
+                f"#{int(rank_position)}<br>"
+            )
 
         return f"""
         <div style="font-size:15px;line-height:1.65;">
@@ -2571,6 +2711,7 @@ class SmzdmScraper:
           <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
           🕒 发布：{pub_time}<br>
           📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
+          {rank_line}
           {price_drop_line}
           👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
           💬 评论：{data['comments']}{comment_count_suffix} | ⭐ 收藏：{data['collection']}<br>
@@ -2795,6 +2936,10 @@ class SmzdmScraper:
         logging.info("=" * 50)
         logging.info(f"扫描完成:")
         logging.info(f"  获取商品: {self.stats['total_fetched']}")
+        logging.info(f"  排行榜获取: {self.stats['total_rank_fetched']}")
+        logging.info(f"  排行榜合并主列表: {self.stats['total_rank_merged']}")
+        logging.info(f"  排行榜候选: {self.stats['total_rank_candidates']}")
+        logging.info(f"  排行榜不可用: {self.stats['total_rank_unavailable']}")
         logging.info(f"  频道元数据补充: {self.stats['total_channel_metadata_enriched']}")
         logging.info(f"  详情评论数更新: {self.stats['total_comment_count_upgraded']}")
         logging.info(f"  候选快照保存: {self.stats['total_candidate_snapshots_saved']}")

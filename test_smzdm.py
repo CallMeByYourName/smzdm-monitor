@@ -19,6 +19,8 @@ class SmzdmFilterTests(unittest.TestCase):
             "加州宝宝海外京东自营关注领五；豆",
             "S图伦JD旗舰店关注45D",
             "金融汇添抽奖88，大概率",
+            "兰芝会员积分兑换实物",
+            "评论有奖：发布评论赢现金奖励",
             "京棟 河南首豫白酒专营店有2 0",
             "京棟 礼来蓉城旗舰店 共计二十个豆",
             "美士京东自营旗舰店 加购 如图",
@@ -42,6 +44,9 @@ class SmzdmFilterTests(unittest.TestCase):
             "小米京东自营旗舰店 加购价199元 智能空气炸锅 6L",
             "PLUS会员：洁柔 抽纸缤纷系列原生木浆 3层 100抽*20包",
             "1号会员店 尊享年卡送（2斤冷冻金枕榴莲+240枚鸡蛋）",
+            "COSTA 咖世家 入会专享醇小杯系列任选",
+            "Hape 多向轨道大转盘 E3723 儿童益智玩具",
+            "仙居酒店1晚+杨梅节抽奖一张+欢迎水果+餐厅消费券",
         ]
         for title in titles:
             with self.subTest(title=title):
@@ -52,6 +57,78 @@ class SmzdmFilterTests(unittest.TestCase):
             {"comments": 12, "collection": 3, "worthy": 0, "unworthy": 0}
         )
         self.assertEqual(metrics["score_rate"], 0)
+
+    def test_rank_item_maps_all_interaction_metrics(self):
+        row = {
+            "article_id": "178128662",
+            "article_channel_type": "youhui",
+            "article_title": "京鲜生 新疆吊干杏 净重2斤",
+            "article_subtitle": "29.5元（需用券）",
+            "article_url": "https://m.smzdm.com/p/178128662/",
+            "article_date": "09:27",
+            "article_timesort": "1783906029",
+            "article_mall": "京东",
+            "article_worthy": "284",
+            "article_unworthy": "31",
+            "article_collection": "268",
+            "article_comment": "1345",
+            "article_stock_status": 0,
+        }
+        parsed = self.scraper._parse_rank_item(row, 4)
+        self.assertEqual(parsed["worthy"], 284)
+        self.assertEqual(parsed["unworthy"], 31)
+        self.assertEqual(parsed["collection"], 268)
+        self.assertEqual(parsed["comments"], 1345)
+        self.assertEqual(parsed["rank_position"], 4)
+
+    def test_rank_metrics_upgrade_stale_list_counts(self):
+        parsed = {"comments": 20, "collection": 5, "worthy": 4, "unworthy": 1, "link": ""}
+        row = {
+            "article_comment": "338",
+            "article_collection": "8",
+            "article_worthy": "14",
+            "article_unworthy": "1",
+            "article_url": "https://m.smzdm.com/p/178457908/",
+        }
+        self.scraper._apply_rank_metrics(parsed, row, 16)
+        self.assertEqual(parsed["comments"], 338)
+        self.assertEqual(parsed["collection"], 8)
+        self.assertEqual(parsed["worthy"], 14)
+        self.assertEqual(parsed["rank_position"], 16)
+
+    def test_rank_source_does_not_bypass_low_score_rate(self):
+        parsed = {
+            "title": "富德 FG87 三模机械键盘",
+            "comments": 291,
+            "collection": 596,
+            "worthy": 106,
+            "unworthy": 32,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": self.scraper._empty_trend_metrics(),
+            "rank_source": True,
+        }
+        self.assertFalse(self.scraper._filter_stage1(parsed))
+
+    def test_rank_waf_response_is_optional(self):
+        class Response:
+            status_code = 202
+
+        class Session:
+            @staticmethod
+            def get(*args, **kwargs):
+                return Response()
+
+        self.scraper.session = Session()
+        self.scraper.stats = {"total_rank_unavailable": 0, "total_rank_fetched": 0}
+        self.assertEqual(self.scraper._fetch_rank_rows(), [])
+        self.assertEqual(self.scraper.stats["total_rank_unavailable"], 1)
+
+    def test_color_choice_suffixes_share_a_fingerprint(self):
+        first = self.scraper._build_title_fingerprint("蕉下 透气 男士短袖T恤（5色可选）")
+        second = self.scraper._build_title_fingerprint("蕉下 透气 男士短袖T恤（多色可选）")
+        self.assertEqual(first, second)
 
     def test_comment_only_growth_cannot_confirm_warming(self):
         trend = self.scraper._empty_trend_metrics()
