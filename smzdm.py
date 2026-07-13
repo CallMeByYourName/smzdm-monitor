@@ -25,10 +25,10 @@ DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 
 CONFIG = {
     # 扫描参数
-    "max_pages": 200,                   # 每次运行最多扫描页数
+    "max_pages": 40,                    # 100 条/页，仍保持每轮最多 4000 条
     "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
-    "items_per_page": 20,
+    "items_per_page": 100,              # 实测接口上限为 100，减少实时分页漂移和请求次数
     "rank_source_enabled": True,       # 总榜补充会重新浮出超过 6 小时但近期升温的商品
     "rank_source_url": "https://m.smzdm.com/sou/category_rank",
     "rank_source_hour": 12,
@@ -259,6 +259,9 @@ class SmzdmScraper:
             'total_rank_merged': 0,
             'total_rank_candidates': 0,
             'total_rank_unavailable': 0,
+            'total_rank_duplicates': 0,
+            'total_rank_filtered_title': 0,
+            'total_rank_filtered_stage1': 0,
             'total_sent': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
@@ -610,6 +613,12 @@ class SmzdmScraper:
     def _consider_stage1_candidate(self, parsed, candidates):
         if self._is_duplicate(parsed):
             self.stats['total_duplicates'] += 1
+            if parsed.get('rank_source'):
+                self.stats['total_rank_duplicates'] += 1
+                logging.info(
+                    f"[排行榜跳过:重复 #{parsed.get('rank_position')}] "
+                    f"{parsed['title'][:40]}..."
+                )
             return
 
         self._attach_trend_metrics(parsed)
@@ -617,10 +626,22 @@ class SmzdmScraper:
 
         if self._is_title_blocked(parsed):
             self.stats['total_filtered_title_pattern'] += 1
+            if parsed.get('rank_source'):
+                self.stats['total_rank_filtered_title'] += 1
             return
 
         if not self._filter_stage1(parsed):
             self.stats['total_filtered_stage1'] += 1
+            if parsed.get('rank_source'):
+                self.stats['total_rank_filtered_stage1'] += 1
+                metrics = self._current_interaction_metrics(parsed)
+                logging.info(
+                    f"[排行榜跳过:评分 #{parsed.get('rank_position')}] "
+                    f"{parsed['title'][:40]}... | "
+                    f"评分:{metrics['composite_score']} 好评率:{metrics['score_rate']}% "
+                    f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                    f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
+                )
             return
 
         candidates.append(parsed)
@@ -2940,6 +2961,9 @@ class SmzdmScraper:
         logging.info(f"  排行榜合并主列表: {self.stats['total_rank_merged']}")
         logging.info(f"  排行榜候选: {self.stats['total_rank_candidates']}")
         logging.info(f"  排行榜不可用: {self.stats['total_rank_unavailable']}")
+        logging.info(f"  排行榜重复跳过: {self.stats['total_rank_duplicates']}")
+        logging.info(f"  排行榜标题过滤: {self.stats['total_rank_filtered_title']}")
+        logging.info(f"  排行榜评分过滤: {self.stats['total_rank_filtered_stage1']}")
         logging.info(f"  频道元数据补充: {self.stats['total_channel_metadata_enriched']}")
         logging.info(f"  详情评论数更新: {self.stats['total_comment_count_upgraded']}")
         logging.info(f"  候选快照保存: {self.stats['total_candidate_snapshots_saved']}")

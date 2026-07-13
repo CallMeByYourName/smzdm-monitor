@@ -1,12 +1,16 @@
 import unittest
 
-from smzdm import SmzdmScraper
+from smzdm import CONFIG, SmzdmScraper
 
 
 class SmzdmFilterTests(unittest.TestCase):
     def setUp(self):
         self.scraper = SmzdmScraper.__new__(SmzdmScraper)
         self.scraper.quality_path_pass_counts = {}
+
+    def test_main_feed_uses_api_page_limit_without_reducing_scan_budget(self):
+        self.assertEqual(CONFIG["items_per_page"], 100)
+        self.assertEqual(CONFIG["items_per_page"] * CONFIG["max_pages"], 4000)
 
     def test_task_title_variants_are_blocked(self):
         blocked_titles = [
