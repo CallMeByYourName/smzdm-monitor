@@ -31,7 +31,8 @@ CONFIG = {
     "items_per_page": 100,              # 实测接口上限为 100，减少实时分页漂移和请求次数
     "rank_source_enabled": True,       # 总榜补充会重新浮出超过 6 小时但近期升温的商品
     "rank_source_url": "https://m.smzdm.com/sou/category_rank",
-    "rank_source_hour": 12,
+    "rank_source_hours": [3, 12],      # 每半小时轮换，仍保持每轮只请求一个榜单
+    "rank_source_slot_seconds": 1800,
     "rank_source_limit": 20,           # 每轮只请求一次总榜，避免增加反爬压力
 
     # 第一阶段：综合评分筛选
@@ -657,13 +658,14 @@ class SmzdmScraper:
     def _fetch_rank_rows(self):
         if not CONFIG.get('rank_source_enabled'):
             return []
+        rank_hour = self._select_rank_source_hour()
         try:
             response = self.session.get(
                 CONFIG['rank_source_url'],
                 params={
                     'page': 1,
                     'limit': CONFIG['rank_source_limit'],
-                    'hour': CONFIG['rank_source_hour'],
+                    'hour': rank_hour,
                 },
                 headers={
                     'Accept': 'application/json, text/plain, */*',
@@ -682,14 +684,25 @@ class SmzdmScraper:
                 self.stats['total_rank_unavailable'] += 1
                 logging.warning("排行榜补充返回格式异常，继续主列表扫描")
                 return []
-            rows = rows[:CONFIG['rank_source_limit']]
+            rows = [
+                {**row, '_rank_window_hours': rank_hour}
+                for row in rows[:CONFIG['rank_source_limit']]
+                if isinstance(row, dict)
+            ]
             self.stats['total_rank_fetched'] += len(rows)
-            logging.info(f"排行榜补充获取: {len(rows)} 条（{CONFIG['rank_source_hour']}小时总榜）")
+            logging.info(f"排行榜补充获取: {len(rows)} 条（{rank_hour}小时总榜）")
             return rows
         except Exception as e:
             self.stats['total_rank_unavailable'] += 1
             logging.warning(f"排行榜补充请求异常: {e}，继续主列表扫描")
             return []
+
+    @staticmethod
+    def _select_rank_source_hour(now_ts=None):
+        hours = CONFIG.get('rank_source_hours') or [12]
+        slot_seconds = max(1, int(CONFIG.get('rank_source_slot_seconds') or 1800))
+        slot = int((time.time() if now_ts is None else now_ts) // slot_seconds)
+        return int(hours[slot % len(hours)])
 
     def _parse_rank_item(self, row, position):
         mapped = {
@@ -743,7 +756,9 @@ class SmzdmScraper:
             )
         parsed['rank_source'] = True
         parsed['rank_position'] = position
-        parsed['rank_window_hours'] = CONFIG['rank_source_hour']
+        parsed['rank_window_hours'] = SmzdmScraper._safe_nonnegative_int(
+            row.get('_rank_window_hours')
+        ) or int((CONFIG.get('rank_source_hours') or [12])[-1])
         if not parsed.get('link'):
             parsed['link'] = str(row.get('article_url') or '').strip()
 

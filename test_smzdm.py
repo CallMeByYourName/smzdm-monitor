@@ -12,6 +12,11 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertEqual(CONFIG["items_per_page"], 100)
         self.assertEqual(CONFIG["items_per_page"] * CONFIG["max_pages"], 4000)
 
+    def test_rank_windows_alternate_without_increasing_requests(self):
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=0), 3)
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=1800), 12)
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=3600), 3)
+
     def test_task_title_variants_are_blocked(self):
         blocked_titles = [
             "店铺领5️⃣",
@@ -128,6 +133,30 @@ class SmzdmFilterTests(unittest.TestCase):
         self.scraper.stats = {"total_rank_unavailable": 0, "total_rank_fetched": 0}
         self.assertEqual(self.scraper._fetch_rank_rows(), [])
         self.assertEqual(self.scraper.stats["total_rank_unavailable"], 1)
+
+    def test_rank_fetch_uses_one_selected_window_request(self):
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"error_code": 0, "data": {"rows": [{"article_id": "1"}]}}
+
+        class Session:
+            calls = []
+
+            @classmethod
+            def get(cls, *args, **kwargs):
+                cls.calls.append((args, kwargs))
+                return Response()
+
+        self.scraper.session = Session()
+        self.scraper.stats = {"total_rank_unavailable": 0, "total_rank_fetched": 0}
+        self.scraper._select_rank_source_hour = lambda: 3
+        rows = self.scraper._fetch_rank_rows()
+        self.assertEqual(len(Session.calls), 1)
+        self.assertEqual(Session.calls[0][1]["params"]["hour"], 3)
+        self.assertEqual(rows[0]["_rank_window_hours"], 3)
 
     def test_color_choice_suffixes_share_a_fingerprint(self):
         first = self.scraper._build_title_fingerprint("蕉下 透气 男士短袖T恤（5色可选）")

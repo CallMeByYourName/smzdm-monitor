@@ -7,11 +7,11 @@
 ### 1. 数据源
 
 - 主列表接口：`https://api.smzdm.com/v1/list?limit=100&offset=N`
-- 12 小时热榜补充：`https://m.smzdm.com/sou/category_rank?page=1&limit=20&hour=12`
+- 3/12 小时热榜补充：`https://m.smzdm.com/sou/category_rank?page=1&limit=20&hour=N`
 - 频道列表补充接口：`https://api.smzdm.com/v1/faxian/list?...&version=2`、`https://api.smzdm.com/v1/youhui/list?...&version=2`
 - 只扫描 `faxian`、`youhui` 两类频道。
 - 主列表负责发现候选和读取互动数据；频道列表用于补充 `article_link`、`article_mall_client.mall_no`、`article_mall_client.product_no`。这些字段不是每条都有，脚本只在接口能提供时使用。
-- 主列表每页读取接口实际支持的 100 条上限，最多 40 页/4000 条和过去 6 小时数据，减少请求次数及实时分页漂移；热榜每轮只请求一次前 20 条，用于重新发现发布较早、但近期重新升温的商品。热榜商品不会直接推送，仍需经过相同的标题、互动质量、评论、趋势和去重规则。
+- 主列表每页读取接口实际支持的 100 条上限，最多 40 页/4000 条和过去 6 小时数据，减少请求次数及实时分页漂移；热榜按半小时窗口在 3 小时榜和 12 小时榜之间轮换，每轮仍只请求一个榜单的前 20 条。3 小时榜用于更早发现短期升温，12 小时榜用于补回发布较早、近期重新升温的商品。热榜商品不会直接推送，仍需经过相同的标题、互动质量、评论、趋势和去重规则。
 - 脚本是单次运行模式：扫描 -> 筛选 -> 推送 -> 退出，没有常驻循环。
 
 ### 2. 第一阶段：互动评分初筛
