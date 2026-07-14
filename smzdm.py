@@ -29,6 +29,7 @@ CONFIG = {
     "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 100,              # 实测接口上限为 100，减少实时分页漂移和请求次数
+    "max_consecutive_page_failures": 3, # 主列表连续失败时结束本轮，交给下一次定时任务重试
     "rank_source_enabled": True,       # 总榜补充会重新浮出超过 6 小时但近期升温的商品
     "rank_source_url": "https://m.smzdm.com/sou/category_rank",
     "rank_source_hours": [3, 12],      # 每半小时轮换，仍保持每轮只请求一个榜单
@@ -208,6 +209,14 @@ CONFIG = {
         r"(?:旗舰店|专营店|专卖店|店铺).{0,24}共计.{0,12}(?:个?豆|京豆)",
         r"(?:旗舰店|专营店|专卖店|店铺).{0,12}有\s*(?:\d[\d\s]*|[零一二两三四五六七八九十百]+)\s*$",
         r"(?:^|\s)来来来.{0,12}(?:一百|100)的?\s*$",
+        # 店铺运营任务不一定写明“京豆”，但标题结尾只有动作或奖励数值。
+        r"积分.{0,12}(?:兑|兑换).{0,12}\d+\s*(?:京豆|豆(?![\u4e00-\u9fff]))?\s*$",
+        r"(?:旗舰店|专营店|专卖店|店铺|店铺会员).{0,24}(?:入会|关注|加购).{0,8}\d+\s*$",
+        r"店铺活动.{0,40}(?:关注|加购|抽奖|抽好礼|领)",
+        r"京自.{0,8}(?:加|领(?:京豆)?)\s*$",
+        r"(?:京自|旗舰店|专营店|专卖店|店铺).{0,12}领京豆\s*$",
+        r"(?:旗舰店|专营店|专卖店|店铺).{0,12}\d+\s*元?\s*(?:红包|优惠券)\s*$",
+        r"(?:官旗|旗舰店).{0,12}加\s*g[o0]\s*l[o0]\s*$",
     ],
 
     # 去重参数
@@ -229,7 +238,8 @@ CONFIG = {
     # 请求参数
     "request_delay": (0.5, 1.5),        # 随机延迟范围（秒）
     "external_request_delay": (1.5, 3.5), # 详情/跳转类请求更慢，降低反爬风险
-    "timeout": 30,                      # 请求超时（秒），GitHub Actions 到国内 API 延迟较高
+    "timeout": (8, 20),                # 连接/读取超时；失败尽快交给下一轮扫描重试
+    "max_consecutive_comment_failures": 2, # 评论接口连续失败时熔断本轮外部校验
     "waf_status_codes": [202, 403, 429],
     "waf_markers": ["probe.js", "tcaptcha", "验证码", "captcha", "访问过于频繁"],
 }
@@ -277,6 +287,8 @@ class SmzdmScraper:
             'total_deferred_trend_confirmation': 0,
             'total_filtered_title_pattern': 0,
             'total_filtered_stage1': 0,
+            'total_page_request_failures': 0,
+            'total_main_scan_aborted': 0,
             'total_filtered_jd_self': 0,
             'total_filtered_comment_level': 0,
             'total_filtered_shill': 0,
@@ -307,11 +319,22 @@ class SmzdmScraper:
         self.comment_level_checks = 0
         self.comment_level_check_limit = CONFIG['comment_level_check_min_per_run']
         self.external_checks_suspended = False
+        self.consecutive_comment_request_failures = 0
         self.snapshot_keys_seen_this_run = set()
         self.pending_snapshot_writes = 0
 
     def _init_session(self):
-        retry = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=1,
+            status=2,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=frozenset({'GET'}),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=20)
         self.session.mount('https://', adapter)
         self.session.headers.update({
@@ -566,6 +589,7 @@ class SmzdmScraper:
             if str(row.get('article_id', '')).strip()
         }
         processed_ids = set()
+        consecutive_page_failures = 0
 
         for page in range(1, CONFIG['max_pages'] + 1):
             if stop_scanning:
@@ -573,7 +597,17 @@ class SmzdmScraper:
 
             items = self._fetch_page(page)
             if items is None:
+                consecutive_page_failures += 1
+                self.stats['total_page_request_failures'] += 1
+                if consecutive_page_failures >= CONFIG['max_consecutive_page_failures']:
+                    self.stats['total_main_scan_aborted'] += 1
+                    logging.error(
+                        f"主列表连续 {consecutive_page_failures} 页请求失败，结束本轮扫描，"
+                        "等待下一次定时任务重试"
+                    )
+                    break
                 continue
+            consecutive_page_failures = 0
             if not items:
                 logging.info(f"第{page}页无数据，停止扫描")
                 break
@@ -1188,6 +1222,8 @@ class SmzdmScraper:
         text = re.sub(r'[⑧❽➇]', '8', text)
         text = re.sub(r'[⑨❾➈]', '9', text)
         text = re.sub(r'\s+', ' ', text)
+        for token in ('入会', '京自', '店铺'):
+            text = re.sub(r'\s+'.join(token), token, text)
         return text.strip()
 
     @staticmethod
@@ -2402,10 +2438,13 @@ class SmzdmScraper:
                 return [], empty_meta
             if response.status_code != 200:
                 logging.warning(f"评论等级接口 HTTP {response.status_code}: {article_id}")
+                self._record_comment_request_failure(f"HTTP {response.status_code}")
                 return [], empty_meta
             resp_json = response.json()
+            self.consecutive_comment_request_failures = 0
         except Exception as e:
             logging.warning(f"评论等级接口请求失败 {article_id}: {e}")
+            self._record_comment_request_failure(type(e).__name__)
             return [], empty_meta
 
         all_samples = []
@@ -2535,6 +2574,14 @@ class SmzdmScraper:
             self.external_checks_suspended = True
             self.stats['total_external_checks_suspended'] += 1
             logging.warning(f"[外部校验熔断] {reason}，本轮停止详情/跳转类请求")
+
+    def _record_comment_request_failure(self, reason):
+        self.consecutive_comment_request_failures += 1
+        limit = max(1, int(CONFIG.get('max_consecutive_comment_failures', 2)))
+        if self.consecutive_comment_request_failures >= limit:
+            self._suspend_external_checks(
+                f"评论等级接口连续 {self.consecutive_comment_request_failures} 次请求失败（{reason}）"
+            )
 
     def _check_shill(self, parsed):
         """第四阶段：互动数据水军检测兜底
@@ -2988,6 +3035,8 @@ class SmzdmScraper:
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  标题正则过滤: {self.stats['total_filtered_title_pattern']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
+        logging.info(f"  主列表请求失败页: {self.stats['total_page_request_failures']}")
+        logging.info(f"  主列表故障提前结束: {self.stats['total_main_scan_aborted']}")
         if self.quality_path_pass_counts:
             path_summary = ", ".join(
                 f"{path}:{count}"

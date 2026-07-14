@@ -34,6 +34,15 @@ class SmzdmFilterTests(unittest.TestCase):
             "京棟 礼来蓉城旗舰店 共计二十个豆",
             "美士京东自营旗舰店 加购 如图",
             "来来来这是一百的",
+            "慢来慢来 都有份 积分兑10豆",
+            "维达（Vinda）纸品清洁京东自营旗舰店 入 会1 0",
+            "容声京自加",
+            "小天才京自领京豆",
+            "京东 悦诗风吟 店铺活动（加购 10）",
+            "京东 海尔智家 店铺活动（首页关注店铺抽好礼）",
+            "京东 蔓迪 店铺会员入会50",
+            "悠格码京东自营旗舰店1元红包",
+            "保乐力加官旗 加 go lO",
         ]
         for title in blocked_titles:
             with self.subTest(title=title):
@@ -157,6 +166,40 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertEqual(len(Session.calls), 1)
         self.assertEqual(Session.calls[0][1]["params"]["hour"], 3)
         self.assertEqual(rows[0]["_rank_window_hours"], 3)
+
+    def test_main_scan_stops_after_consecutive_page_failures(self):
+        calls = []
+        self.scraper._fetch_rank_rows = lambda: []
+        self.scraper._fetch_page = lambda page: calls.append(page)
+        self.scraper._commit_candidate_snapshots = lambda: None
+        self.scraper.stats = {
+            "total_fetched": 0,
+            "total_page_request_failures": 0,
+            "total_main_scan_aborted": 0,
+        }
+
+        self.assertEqual(self.scraper._scan_and_filter_stage1(), [])
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(self.scraper.stats["total_page_request_failures"], 3)
+        self.assertEqual(self.scraper.stats["total_main_scan_aborted"], 1)
+
+    def test_comment_request_failures_trip_external_circuit_breaker(self):
+        class Session:
+            @staticmethod
+            def get(*args, **kwargs):
+                raise TimeoutError("comment endpoint timed out")
+
+        self.scraper.session = Session()
+        self.scraper._throttle_external_request = lambda: None
+        self.scraper.external_checks_suspended = False
+        self.scraper.consecutive_comment_request_failures = 0
+        self.scraper.stats = {"total_external_checks_suspended": 0}
+
+        self.scraper._fetch_comment_samples("1")
+        self.assertFalse(self.scraper.external_checks_suspended)
+        self.scraper._fetch_comment_samples("2")
+        self.assertTrue(self.scraper.external_checks_suspended)
+        self.assertEqual(self.scraper.stats["total_external_checks_suspended"], 1)
 
     def test_color_choice_suffixes_share_a_fingerprint(self):
         first = self.scraper._build_title_fingerprint("蕉下 透气 男士短袖T恤（5色可选）")

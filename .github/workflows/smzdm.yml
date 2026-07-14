@@ -1,7 +1,7 @@
 name: SMZDM 好价监控 NEW
 
 on:
-  # 由 cron-job.org 每 30 分钟触发。不要再叠加 GitHub schedule，避免重复扫描。
+  # 由 cron-job.org 每 15 分钟触发。不要再叠加 GitHub schedule，避免重复扫描。
   workflow_dispatch:
   repository_dispatch:
     types: [cron_trigger]
@@ -13,6 +13,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
