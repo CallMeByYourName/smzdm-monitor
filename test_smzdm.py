@@ -226,6 +226,22 @@ class SmzdmFilterTests(unittest.TestCase):
         second = self.scraper._build_title_fingerprint("蕉下 透气 男士短袖T恤（多色可选）")
         self.assertEqual(first, second)
 
+    def test_price_in_title_keeps_product_fingerprint(self):
+        fingerprint = self.scraper._build_title_fingerprint(
+            "中国电信 19元205G全国流量不限速100分钟"
+        )
+        self.assertTrue(fingerprint)
+        self.assertIn("205g全国流量", fingerprint)
+
+    def test_changed_leading_price_shares_a_fingerprint(self):
+        first = self.scraper._build_title_fingerprint(
+            "22.5元/斤：元牧希 新西兰进口羔羊排肉卷2斤"
+        )
+        second = self.scraper._build_title_fingerprint(
+            "18.5元/斤：元牧希 新西兰进口羔羊排肉卷2斤"
+        )
+        self.assertEqual(first, second)
+
     def test_comment_only_growth_cannot_confirm_warming(self):
         trend = self.scraper._empty_trend_metrics()
         trend.update({

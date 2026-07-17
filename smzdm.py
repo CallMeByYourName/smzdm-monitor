@@ -964,7 +964,8 @@ class SmzdmScraper:
         for word in promo_words:
             text = text.replace(word, '')
 
-        text = re.sub(r'\d+(\.\d+)?\s*元.*$', '', text)
+        # 价格可能出现在商品名前或套餐名中；只归一化金额，不能删除后面的商品主体。
+        text = re.sub(r'\d+(?:\.\d+)?\s*元', '价格', text)
         text = re.sub(r'[（(](?:\d+色|多色|多款)可选[）)]', '', text)
         text = re.sub(r'[^\w\u4e00-\u9fff]+', '', text)
         if len(text) < CONFIG['fingerprint_min_len']:
