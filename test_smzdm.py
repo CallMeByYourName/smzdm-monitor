@@ -136,7 +136,7 @@ class SmzdmFilterTests(unittest.TestCase):
         mock_post.return_value.status_code = 200
         mock_post.return_value.json.return_value = {"success": True}
         data = {
-            "article_id": "178999999",
+            "id": "178999999",
             "title": "测试商品",
             "quality_path": "升温好价",
             "price": "19.9元",

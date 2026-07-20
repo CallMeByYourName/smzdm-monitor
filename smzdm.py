@@ -2699,7 +2699,7 @@ class SmzdmScraper:
                     metrics = self._current_interaction_metrics(data)
                     logging.info(
                         f"[推送成功] {data['title'][:40]}... | "
-                        f"id:{data.get('article_id', '-')} "
+                        f"id:{data.get('id') or data.get('article_id', '-')} "
                         f"路径:{data.get('quality_path', '未知')} "
                         f"价格:{data.get('price', '-')} "
                         f"评分:{metrics['composite_score']} "
