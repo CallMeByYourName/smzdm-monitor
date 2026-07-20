@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from smzdm import CONFIG, SmzdmScraper
 
@@ -65,6 +66,18 @@ class SmzdmFilterTests(unittest.TestCase):
             "真五折！千仞岗羽绒服专区",
             "京东超市 黑五签到有奖 每日签到可领满200-20元黑五券×3张/超市卡",
             "京东金融 全网订单天天报销 10万奖池等你瓜分 每日选择订单可抽随机现金/京豆",
+            "ROG 加购 20（需入会）",
+            "京东 超级18会场 弹窗可领随机红包 实测0.62元（每日可领）",
+            "光明牛奶京东自营旗舰店 积分兑换京豆",
+            "雅博士海外旗舰店 积分兑换京豆",
+            "沱牌官旗签⑤",
+            "京东 屈臣氏（Watsons）饮料专卖店 加购1个商品5个京豆",
+            "京东 好想你 入会20",
+            "环球好物礼品店关二豆，侧边浮窗刮二十豆，会员一百豆",
+            "马爹利官方旗舰店每日一豆",
+            "vivo X300福袋 购买后参加三个活动 非必中",
+            "京东关注有礼（1）个豆子",
+            "值友专享：深夜游乐场，满18续摊～",
         ]
         for title in blocked_titles:
             with self.subTest(title=title):
@@ -101,6 +114,12 @@ class SmzdmFilterTests(unittest.TestCase):
             "海尔 Leader懒人抽油烟机 92D小黑翼Pro",
             "杰克琼斯 美式翻领夹克 五折专区任选 黑色 L",
             "移动端：润科 宝得聪PS磷脂酰丝氨酸儿童青少年藻油DHA 3岁以上聚力豆",
+            "ROG 加购价20元 游戏鼠标",
+            "COSTA 入会专享醇小杯系列任选",
+            "沃隆 每日坚果 750g",
+            "vivo X300 手机 赠品牌福袋",
+            "沱牌 旗舰店签名纪念酒 500ml",
+            "屈臣氏 苏打水 加购价19.9元",
         ]
         for title in titles:
             with self.subTest(title=title):
@@ -111,6 +130,30 @@ class SmzdmFilterTests(unittest.TestCase):
             {"comments": 12, "collection": 3, "worthy": 0, "unworthy": 0}
         )
         self.assertEqual(metrics["score_rate"], 0)
+
+    @patch("smzdm.requests.post")
+    def test_successful_push_logs_review_fields(self, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"success": True}
+        data = {
+            "article_id": "178999999",
+            "title": "测试商品",
+            "quality_path": "升温好价",
+            "price": "19.9元",
+            "comments": 6,
+            "collection": 8,
+            "worthy": 10,
+            "unworthy": 1,
+        }
+
+        with self.assertLogs(level="INFO") as logs:
+            self.assertTrue(self.scraper._send_notification(data))
+
+        message = "\n".join(logs.output)
+        self.assertIn("id:178999999", message)
+        self.assertIn("路径:升温好价", message)
+        self.assertIn("价格:19.9元", message)
+        self.assertIn("评论:6 收藏:8 值:10 不值:1", message)
 
     def test_rank_item_maps_all_interaction_metrics(self):
         row = {
