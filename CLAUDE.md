@@ -1,125 +1,93 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-20`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
-## Project Overview
+## Project
 
-SMZDM (什么值得买 / "What's Worth Buying") deal monitor. The project runs as a single Python script that scans SMZDM deal listings, filters candidates by engagement quality, checks comment user levels and comment concentration, deduplicates with SQLite, and pushes accepted deals to WeChat via WXPusher.
+SMZDM (什么值得买) deal monitor. `smzdm.py` performs one scan, filters candidates, sends accepted deals through WXPusher, saves state in SQLite, and exits. Scheduling is external; there is no local polling loop.
 
-## Running
+The project deliberately treats list engagement and snapshot growth as its primary evidence. SMZDM does not expose a reliable complete distribution of comment-user levels through the endpoint available to GitHub Actions, and JD store/self-operated fields are also unreliable on hosted runners. Missing external data is diagnostic rather than a default rejection.
+
+## Commands
 
 ```bash
 pip install -r requirements.txt
 WXPUSHER_APP_TOKEN=xxx WXPUSHER_UID=xxx python3 smzdm.py
+python3 -m unittest -v
 ```
 
-Optional:
+`SMZDM_DB_PATH` optionally overrides the default `smzdm.db` path. The sole runtime dependency is `requests`.
 
-- `SMZDM_DB_PATH` sets the SQLite database path. Default: `smzdm.db`.
+## Inputs and Scan Scope
 
-The script is single-run mode: scan once -> filter -> push -> exit. There is no local loop.
+- Main source: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
+- Scan cap: 40 pages, 4000 rows, six hours, and only `faxian`/`youhui` channels.
+- Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, with 3-hour and 12-hour windows alternating every 30 minutes. Ranking items still pass all normal filters.
+- `faxian/list` and `youhui/list` enrich `article_link`, `mall_no`, and `product_no` when present.
+- `tongji_hudong` supplies the preferred comment, collection, worthy, and unworthy counts.
 
-## Architecture
+## Quality Paths
 
-**`smzdm.py`** is the main script and contains `SmzdmScraper`.
+Composite score:
 
-- **Data source**: `https://api.smzdm.com/v1/list?limit=20&offset=N`, enriched by `faxian/list` and `youhui/list` channel APIs when available.
-- **Channel filter**: only `faxian` and `youhui`.
-- **Time window**: max 6 hours.
-- **Stage 1 filter**: weighted engagement scoring: `comments * 3 + collection * 2 + worthy`.
-- **Stage 2 filter**: comment user level and comment concentration checks from `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`.
-- **Stage 3 fallback**: interaction anomaly detection using worthy/unworthy ratio and comment/worthy ratio.
-- **Dedup**: SQLite `history` table plus in-memory article IDs, platform SKU keys when `article_mall_client.product_no` exists, and title fingerprints.
-- **Candidate review state**: SQLite `candidate_snapshots` stores interaction trends; legacy `pending_reviews` remains for compatibility but comment-unavailable deferral is disabled by default.
-- **Push**: WXPusher HTML message.
+```text
+comments * 3 + collection * 2 + worthy
+```
 
-## Current Filtering Rules
+- `超级好价`: comments >= 20, worthy >= 20, collection >= 10, score >= 120, score rate >= 90%.
+- `均衡热度`: comments >= 6, worthy >= 8, collection >= 5, engagement >= 25, score >= 65, score rate >= 90%.
+- `高讨论`: comments >= 12, worthy >= 8, collection >= 5, engagement >= 30, score >= 90, score rate >= 85%.
+- `早期好价`: worthy >= 4, comments >= 6, collection >= 4, engagement >= 16, score >= 35, score rate >= 95%.
+- `早期强信号`: worthy >= 6, collection >= 8, engagement >= 16, score >= 28, score rate >= 95%.
+- `升温好价`: worthy >= 4, collection >= 4, engagement >= 15, score >= 32, score rate >= 95%, plus qualifying snapshot growth with at least one new worthy vote.
 
-Stage 1 has six acceptance paths:
+All paths require at least two worthy votes or two comments. Inactive items are rejected.
 
-- `超级好价`: comments >= 20, worthy >= 20, collection >= 10, composite score >= 120, score rate >= 90%.
-- `均衡热度`: comments >= 6, worthy >= 8, collection >= 5, total engagement >= 25, composite score >= 65, score rate >= 90%.
-- `高讨论`: comments >= 12, worthy >= 8, collection >= 5, total engagement >= 30, composite score >= 90, score rate >= 85%.
-- `早期好价`: worthy >= 4, comments >= 6, collection >= 4, total engagement >= 16, composite score >= 35, score rate >= 95%, followed by trend confirmation unless already strong.
-- `早期强信号`: worthy >= 6, collection >= 8, total engagement >= 16, composite score >= 28, score rate >= 95%, followed by worthy/collection growth confirmation.
-- `升温好价`: worthy >= 4, collection >= 4, total engagement >= 15, composite score >= 32, score rate >= 95%, plus fresh growth that includes at least one new worthy vote.
+The script has no broad category blacklist. Its narrow normalized-regex filter targets non-product tasks and reward pages, including variable `入会...京豆`, follow/add-to-cart/sign-in rewards, points conversion, popup red packets, ambiguous campaign pages, and the concrete variants found in Actions logs. Add paired blocked and allowed regression tests whenever changing title expressions.
 
-Basic signal requirement:
+## Trends
 
-- worthy >= 2 or comments >= 2.
-- inactive deals are filtered if sold out, timed out, expired, or ended.
+`candidate_snapshots` retains two days of interactions. Growth weights are worthy 3, collection 2, comments 4, and unworthy -2.
 
-There is no broad title keyword or category/tag hard exclusion. Carrier cards, coupons, red packets, finance, and similar content should generally be blocked downstream by WXPusher keyword rules if desired.
+- Low-confidence early paths wait for meaningful later growth, including at least one new worthy vote, unless current engagement meets a mature/discussion bypass.
+- Warming deals require recent or sufficiently fast short-window growth. Comment-only, collection-only, or very old slow growth cannot qualify.
+- Low-comment candidates can be filtered for weak growth from about 25 minutes and for slow long-window growth from 240 minutes.
+- `超级好价` and `高讨论` retain explicit trend-filter exemptions in `CONFIG`.
 
-The script does include narrow regex title blocking for task-like Jingdou posts that WXPusher keyword matching cannot express, especially the `入会...京豆` pattern and common variants such as `入会5豆`, `关注...1豆`, `关注领京豆`, `签到100豆`, `抽奖50豆`, and `竞猜瓜分2万京豆`.
+Filtered or failed-push items do not enter push history, so they remain eligible for later reevaluation.
 
-## Comment-Level Logic
+## Comments
 
-Candidate snapshots are stored in SQLite `candidate_snapshots` for 2 days. The scraper compares current worthy, collection, comments, and unworthy counts against older snapshots to compute growth score and recent growth score. This trend score is the primary substitute for unavailable full-comment level distribution.
+Comment samples use `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`. This is normally a hot/related module, not full pagination. Author comments are excluded, and the module total may upgrade the list comment count.
 
-Trend data is also a filter:
+Hard level/concentration decisions require a representative module response: about 80% coverage or no more than two missing comments.
 
-- Low-confidence early deals on `早期好价` or `早期强信号` wait until a later run has meaningful growth that includes at least one new worthy vote. A snapshot or collection-only growth is not confirmation.
-- `升温好价` requires fresh growth that includes at least one new worthy vote. Comment-only, collection-only, and old cumulative growth must not create a warming deal.
-- Non-exempt deals with at least one prior snapshot are filtered as low-growth if they have been observed for about 25 minutes, still have few comments, and both total and recent growth scores are weak.
-- Deals with a long observation window, low comments, little recent growth, and weak cumulative growth speed are filtered as slow-growth.
-- `超级好价` and `高讨论` are exempt from the low-growth and slow-growth filters.
+- Lv5 and below is low level; Lv6 and above is high level.
+- Reject a representative sample when low-level ratio exceeds 35%.
+- With at least four samples, reject fewer than three users or one user above 50%.
+- Undercovered or unavailable data does not block a deal by default.
+- The dynamic external-check budget covers all normally eligible candidates up to 80 per run.
 
-Comment level checks use the SMZDM mobile JSON module, not Playwright. This module is not the full comment pagination endpoint; it usually returns hot/related comment samples. The code records module total, raw samples, author comments, and non-author samples for diagnosis. Author comments are excluded by both `display_author` and module `author_smzdm_id`.
+`pending_reviews` remains for compatibility, but unavailable-comment deferral is disabled.
 
-If the module-declared total comment count is higher than the list API comment count, the script upgrades the candidate comment count and recomputes the composite score from that module total.
+## JD and Deduplication
 
-Before applying level/concentration rules, the scraper checks module coverage by comparing raw returned comment nodes with `max(list API comment count, module-declared total comments)`. Samples are considered representative only when they cover about 80% of that total or differ by at most 2 comments. If the total already has at least 10 comments but the module only returns a small hot-comment subset, comment-level shill judgment is skipped instead of filtering or deferring on those few samples.
+JD self-operated hard filtering is disabled (`jd_self_filter_enabled = False`) because hosted runners cannot reliably retrieve store or `isSelf` data. JD follows the same generic quality rules as every other platform.
 
-- Low level: Lv5 and below.
-- High level: Lv6 and above.
-- Filter when low-level comment ratio is greater than 35%.
-- When at least 4 comment samples are available, also filter if unique users are fewer than 3 or one user accounts for more than 50% of samples.
-- Mature balanced/high-discussion deals may pass with only 2 non-author samples only after the module is representative, when both samples are Lv6+, from different users, score rate >= 85%, and comments >= 10 or composite score >= 80.
-- If module coverage is insufficient, comment-level judgment is treated as diagnostic and does not block deals that passed interaction/trend scoring.
-- Emerging deals do not use the partial-sample pass.
+Only successful pushes are recorded. Dedup uses article ID, platform product key when available, and normalized title fingerprint. Fingerprints remain active for 30 days. A matching SKU or fingerprint can be pushed again when the parsed price drops by at least RMB 5 or 5% from the previous minimum.
 
-Unavailable comment data is diagnostic by default:
+## Stability and Deployment
 
-- The per-run comment check budget is dynamic: check all normally checkable candidates, capped at 80 to avoid excessive external requests during candidate spikes.
-- Early strong-signal deals skip comment-level judgment when list comments are below the comment-level threshold, because SMZDM comments can lag while awaiting review.
-- Representative low-level or concentrated comment samples can still hard-filter a deal.
-- Missing, undercovered, or budget-unavailable comment data does not defer by default.
-- Initial interaction that does not grow fast enough across later snapshots can be filtered as low-growth, slow-growth, or trend-stale when comments remain low.
+Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment failures suspend external checks for the rest of that run.
 
-## JD Handling
+`.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, and `actions/cache` for SQLite.
 
-JD self-operated hard filtering is disabled by default. GitHub Actions often cannot reliably read JD store/self-operated fields from external pages, so JD deals are handled by the same generic comment-level, concentration, interaction anomaly, and dedup rules as other platforms.
+`actions/cache` is not transactional state. Closely spaced or retried runs may restore an older database, so the current system cannot promise exactly-once notifications.
 
-The old JD self-check helpers remain in the code behind `jd_self_filter_enabled`, but the default config is `False`.
+## Change Discipline
 
-## Dedup and Re-Push Rules
-
-- Only successfully pushed deals are saved to `history`.
-- Same article ID is skipped after being saved.
-- Same platform SKU key is skipped when channel APIs expose `article_mall_client.product_no`.
-- Similar title fingerprints are deduped for 30 days.
-- Same SKU or fingerprint can be pushed again if the new price is at least 5 RMB lower or at least 5% lower than the previous pushed minimum.
-- Filtered or failed-push deals are not written to `history`, so later scans can reevaluate them with newer data and candidate snapshots.
-
-## Deployment
-
-`.github/workflows/smzdm.yml`:
-
-- Triggered every 30 minutes by cron-job.org. GitHub schedule is intentionally disabled to avoid duplicate timers.
-- Supports manual `workflow_dispatch`.
-- Supports `repository_dispatch` for external cron-job.org triggers.
-- Persists `smzdm.db` with `actions/cache`.
-- Uses `concurrency: smzdm-scan`.
-
-Note: `actions/cache` is not a fully reliable mutable database store. Closely spaced runs can restore an older cache and may produce duplicate pushes. A state branch, artifact, external KV, or external database would be more robust.
-
-## Key Technical Notes
-
-- Dependency list is intentionally minimal: `requests`.
-- `tongji_hudong` is parsed for precise interaction data (`评论_5,收藏_3,值_10,不值_2`) with top-level field fallback.
-- `faxian/list` and `youhui/list` are used as low-risk metadata enrichment sources for `article_link`, `mall_no`, and `product_no`; external go-link resolution is not part of core filtering.
-- `candidate_snapshots` stores near-real-time interaction counts so later runs can identify warming deals and stalled suspicious deals.
-- External comment/detail requests are throttled with random delays.
-- WAF-like responses (`202`, `403`, `429`, captcha markers, `probe.js`, access-frequency text) suspend external checks for the rest of the current run.
-- Notification content includes score tag, price, score rate, engagement numbers, trend growth, comment coverage, comment level stats when available, price-drop notes, and the SMZDM detail link. Very long trend windows are not shown as cumulative growth; the notification only shows recent-run growth for old snapshots.
+- Base parser and filter changes on real API payloads or Actions logs.
+- Preserve bounded external traffic and graceful degradation when optional sources fail.
+- Add focused tests for new title variants, parsing assumptions, trends, and dedup behavior.
+- Run `python3 -m unittest -v` and `git diff --check` before committing.
+- Update `README.md`, `AGENTS.md`, and this file together when thresholds, sources, scheduling, or notification behavior changes.

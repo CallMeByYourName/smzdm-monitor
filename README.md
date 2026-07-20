@@ -2,6 +2,8 @@
 
 基于 GitHub Actions 的单次扫描脚本。它抓取什么值得买好价列表，先用互动数据筛出候选，再通过评论用户等级、评论用户集中度、互动异常、相似商品去重和降价判断，尽量减少水军爆料和重复推送。
 
+本文档按 `2026-07-20` 的代码与工作流配置更新；实际阈值以 `smzdm.py` 中的 `CONFIG` 为准。
+
 ## 当前逻辑
 
 ### 1. 数据源
@@ -141,7 +143,7 @@ https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_i
 
 现在京东商品和其他平台一样，统一走互动评分、评论等级、评论集中度、互动异常和去重逻辑。
 
-### 8. 反爬和稳定性
+### 9. 反爬和稳定性
 
 - 外部详情/评论请求有随机延迟。
 - 如果遇到 `202/403/429`、验证码、`probe.js`、访问频繁等标记，本轮会熔断外部校验。
@@ -160,6 +162,14 @@ WXPUSHER_APP_TOKEN=xxx WXPUSHER_UID=xxx python3 smzdm.py
 - `WXPUSHER_APP_TOKEN`：WXPusher app token。
 - `WXPUSHER_UID`：接收推送的 UID。
 - `SMZDM_DB_PATH`：SQLite 数据库路径，默认 `smzdm.db`。
+
+## 测试
+
+```bash
+python3 -m unittest -v
+```
+
+当前测试覆盖分页和热榜轮换、任务活动标题过滤及商品标题防误伤、互动路径、趋势确认、评论覆盖率、去重降价和推送日志字段。修改筛选阈值或正则后，应先补充对应样本并运行完整测试。
 
 ## GitHub Actions
 
@@ -192,8 +202,12 @@ WXPusher 使用 HTML 内容，包含：
 ## 文件结构
 
 - `smzdm.py`：主脚本。
+- `test_smzdm.py`：筛选、趋势、评论、去重和推送行为的单元测试。
 - `requirements.txt`：运行依赖，目前只有 `requests`。
 - `.github/workflows/smzdm.yml`：GitHub Actions 工作流。
+- `README.md`：面向使用者的现行规则和部署说明。
+- `AGENTS.md`、`CLAUDE.md`：面向代码代理的开发约束与架构说明。
+- `analysis/`：按日期保存的历史日志分析和反馈样本；其中的旧阈值只代表生成当时的代码。
 - `smzdm.db`：运行时 SQLite 数据库，本地和 Actions 缓存使用。
 
 ---
