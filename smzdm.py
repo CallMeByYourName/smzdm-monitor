@@ -815,6 +815,12 @@ class SmzdmScraper:
             if self.external_checks_suspended:
                 break
             article_id = str(row.get('article_id') or '').strip()
+            logging.info(
+                f"[延迟复查请求] id:{article_id} "
+                f"旧评分:{row.get('composite_score', 0)} "
+                f"评论:{row.get('comments', 0)} 收藏:{row.get('collection', 0)} "
+                f"值:{row.get('worthy', 0)} | {str(row.get('title') or '')[:40]}..."
+            )
             self._mark_late_recheck(article_id)
             detail = self._fetch_late_recheck_detail(article_id)
             if not detail:

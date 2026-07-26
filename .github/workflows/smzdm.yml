@@ -78,6 +78,56 @@ jobs:
                )
             ORDER BY last_seen DESC;
           "
+          if sqlite3 smzdm.db "
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'late_recheck_state';
+          " | grep -q '^1$'; then
+            echo "Late-recheck state for article:"
+            sqlite3 -header -column smzdm.db "
+              SELECT article_id, last_checked, retired
+              FROM late_recheck_state
+              WHERE article_id = '$DEBUG_ARTICLE_ID';
+            "
+            echo "Next eligible late-recheck rows:"
+            sqlite3 -header -column smzdm.db "
+              WITH latest AS (
+                SELECT article_id, MAX(captured_at) AS captured_at
+                FROM candidate_snapshots
+                WHERE article_id IS NOT NULL AND article_id != ''
+                GROUP BY article_id
+              )
+              SELECT snapshots.article_id, snapshots.title,
+                     snapshots.worthy, snapshots.collection,
+                     snapshots.comments, snapshots.composite_score,
+                     snapshots.captured_at, recheck.last_checked
+              FROM latest
+              JOIN candidate_snapshots AS snapshots
+                ON snapshots.article_id = latest.article_id
+               AND snapshots.captured_at = latest.captured_at
+              LEFT JOIN history ON history.id = snapshots.article_id
+              LEFT JOIN late_recheck_state AS recheck
+                ON recheck.article_id = snapshots.article_id
+              WHERE history.id IS NULL
+                AND snapshots.captured_at <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-45 minutes')
+                AND COALESCE(recheck.retired, 0) = 0
+                AND (
+                      recheck.last_checked IS NULL
+                      OR recheck.last_checked <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-45 minutes')
+                    )
+                AND (
+                      (snapshots.worthy >= 4 AND snapshots.collection >= 4)
+                      OR snapshots.worthy >= 6
+                      OR snapshots.comments >= 8
+                    )
+                AND (
+                      (julianday('now') - julianday(snapshots.captured_at)) * 24
+                      + COALESCE(snapshots.age_hours, 0)
+                    ) <= 18
+              ORDER BY COALESCE(recheck.last_checked, snapshots.captured_at) ASC,
+                       snapshots.composite_score DESC
+              LIMIT 20;
+            "
+          fi
 
       - name: Run scraper
         env:
