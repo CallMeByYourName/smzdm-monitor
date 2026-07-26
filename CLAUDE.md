@@ -23,7 +23,7 @@ python3 -m unittest -v
 - Main source: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
 - Scan cap: 51 pages, 5100 rows, six hours, and only `faxian`/`youhui` channels. At peak volume the API row cap is reached before the time cap.
 - Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, returning up to 50 rows while 1-hour, 3-hour, and 12-hour windows rotate every 15 minutes. Ranking items still pass all normal filters.
-- Late-detail source: up to four signed JSON requests per run to `https://haojia-api.smzdm.com/detail/{article_id}`. It refreshes previously near-threshold, unsent candidates after they leave the feeds, with an 18-hour horizon and a 45-minute per-article interval. Current-feed/rank IDs are excluded.
+- Late-detail source: 4–16 signed JSON requests per run to `https://haojia-api.smzdm.com/detail/{article_id}`, scaled at 4% of the eligible backlog. It refreshes previously near-threshold, unsent candidates after they leave the feeds, with an 18-hour horizon and a 45-minute per-article interval. Current-feed/rank IDs are excluded.
 - `faxian/list` and `youhui/list` enrich `article_link`, `mall_no`, and `product_no` when present.
 - `tongji_hudong` supplies the preferred comment, collection, worthy, and unworthy counts.
 
@@ -59,7 +59,7 @@ The script has no broad category blacklist. Its narrow normalized-regex filter t
 
 Filtered or failed-push items do not enter push history, so they remain eligible for later reevaluation.
 
-Snapshots with worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8 can seed the bounded late-recheck queue. Refreshed rows do not bypass any normal filter. Inactive details are retired, and `late_recheck_state` provides fair rotation without altering trend history.
+Snapshots with worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8 can seed the bounded late-recheck queue. Refreshed rows do not bypass any normal filter. Inactive details are retired, and `late_recheck_state` prioritizes never-checked candidates nearest the 18-hour deadline before repeat checks without altering trend history.
 
 ## Comments
 

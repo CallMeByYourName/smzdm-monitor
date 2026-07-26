@@ -39,7 +39,9 @@ CONFIG = {
     "rank_source_limit": 50,           # 接口单次最多返回 50 条，仍只请求一次总榜
     "late_recheck_enabled": True,       # 主列表消失后，用按文章 ID 的详情 JSON 补查审核延迟的互动
     "late_recheck_url": "https://haojia-api.smzdm.com/detail/{article_id}",
-    "late_recheck_limit": 4,            # 每轮最多 4 条，避免历史候选形成外部请求洪峰
+    "late_recheck_min_per_run": 4,
+    "late_recheck_candidate_ratio": 0.04,
+    "max_late_rechecks_per_run": 16,    # 积压时动态扩容，仍保留防反爬硬上限
     "late_recheck_interval_minutes": 45,
     "late_recheck_max_age_hours": 18,
     "late_recheck_min_worthy": 4,
@@ -310,6 +312,7 @@ class SmzdmScraper:
             'total_rank_filtered_title': 0,
             'total_rank_filtered_stage1': 0,
             'total_late_recheck_selected': 0,
+            'total_late_recheck_eligible': 0,
             'total_late_recheck_attempted': 0,
             'total_late_recheck_fetched': 0,
             'total_late_recheck_candidates': 0,
@@ -363,6 +366,7 @@ class SmzdmScraper:
         self.external_checks_suspended = False
         self.consecutive_comment_request_failures = 0
         self.consecutive_detail_request_failures = 0
+        self.late_recheck_eligible_count = 0
         self.snapshot_keys_seen_this_run = set()
         self.pending_snapshot_writes = 0
 
@@ -805,16 +809,32 @@ class SmzdmScraper:
         if not CONFIG.get('late_recheck_enabled') or self.external_checks_suspended:
             return
 
-        limit = max(0, int(CONFIG.get('late_recheck_limit', 0)))
-        if limit <= 0:
+        max_limit = max(0, int(CONFIG.get('max_late_rechecks_per_run', 0)))
+        if max_limit <= 0:
             return
 
-        rows = self._select_late_recheck_rows(discovered_ids, limit)
+        rows = self._select_late_recheck_rows(discovered_ids, max_limit)
+        eligible_count = self.late_recheck_eligible_count
+        limit = self._calculate_late_recheck_limit(eligible_count)
+        rows = rows[:limit]
+        self.stats['total_late_recheck_eligible'] = eligible_count
         self.stats['total_late_recheck_selected'] += len(rows)
+        logging.info(
+            f"延迟复查动态预算: {len(rows)}/{limit} 条 "
+            f"（当前符合队列 {eligible_count} 条，硬上限 {max_limit}）"
+        )
         for row in rows:
             if self.external_checks_suspended:
                 break
             article_id = str(row.get('article_id') or '').strip()
+            if self._is_title_blocked({
+                'title': str(row.get('title') or ''),
+                'mall': '',
+            }):
+                self.stats['total_filtered_title_pattern'] += 1
+                self._mark_late_recheck(article_id, retired=True)
+                logging.info(f"[延迟复查退出] article_id:{article_id} 标题已过滤")
+                continue
             logging.info(
                 f"[延迟复查请求] id:{article_id} "
                 f"旧评分:{row.get('composite_score', 0)} "
@@ -850,7 +870,7 @@ class SmzdmScraper:
             SELECT snapshots.article_id, snapshots.title, snapshots.worthy,
                    snapshots.collection, snapshots.comments,
                    snapshots.composite_score, snapshots.age_hours,
-                   snapshots.captured_at
+                   snapshots.captured_at, COUNT(*) OVER() AS eligible_count
             FROM latest
             JOIN candidate_snapshots AS snapshots
               ON snapshots.article_id = latest.article_id
@@ -871,7 +891,12 @@ class SmzdmScraper:
                     (julianday('now') - julianday(snapshots.captured_at)) * 24
                     + COALESCE(snapshots.age_hours, 0)
                   ) <= ?
-            ORDER BY COALESCE(recheck.last_checked, snapshots.captured_at) ASC,
+            ORDER BY CASE WHEN recheck.last_checked IS NULL THEN 0 ELSE 1 END,
+                     (
+                       (julianday('now') - julianday(snapshots.captured_at)) * 24
+                       + COALESCE(snapshots.age_hours, 0)
+                     ) DESC,
+                     COALESCE(recheck.last_checked, snapshots.captured_at) ASC,
                      snapshots.composite_score DESC
             LIMIT ?
             ''',
@@ -889,7 +914,12 @@ class SmzdmScraper:
         excluded = {str(value) for value in (discovered_ids or set())}
         selected = set()
         rows = []
-        for row in cursor.fetchall():
+        fetched_rows = cursor.fetchall()
+        self.late_recheck_eligible_count = max(
+            (self._safe_nonnegative_int(row[8]) for row in fetched_rows),
+            default=0,
+        )
+        for row in fetched_rows:
             article_id = str(row[0] or '').strip()
             if not article_id or article_id in excluded or article_id in selected:
                 continue
@@ -907,6 +937,19 @@ class SmzdmScraper:
             if len(rows) >= limit:
                 break
         return rows
+
+    @staticmethod
+    def _calculate_late_recheck_limit(eligible_count):
+        minimum = max(0, int(CONFIG.get('late_recheck_min_per_run', 0)))
+        maximum = max(minimum, int(CONFIG.get('max_late_rechecks_per_run', minimum)))
+        ratio = min(
+            1,
+            max(0, float(CONFIG.get('late_recheck_candidate_ratio', 0))),
+        )
+        scaled = int(max(0, eligible_count) * ratio)
+        if eligible_count * ratio > scaled:
+            scaled += 1
+        return min(maximum, max(minimum, scaled))
 
     def _mark_late_recheck(self, article_id, retired=False):
         self.conn.execute(
@@ -3403,6 +3446,7 @@ class SmzdmScraper:
         logging.info(f"  排行榜重复跳过: {self.stats['total_rank_duplicates']}")
         logging.info(f"  排行榜标题过滤: {self.stats['total_rank_filtered_title']}")
         logging.info(f"  排行榜评分过滤: {self.stats['total_rank_filtered_stage1']}")
+        logging.info(f"  延迟复查符合队列: {self.stats['total_late_recheck_eligible']}")
         logging.info(f"  延迟复查选中: {self.stats['total_late_recheck_selected']}")
         logging.info(f"  延迟复查请求: {self.stats['total_late_recheck_attempted']}")
         logging.info(f"  延迟复查获取: {self.stats['total_late_recheck_fetched']}")

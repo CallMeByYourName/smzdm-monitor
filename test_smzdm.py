@@ -234,6 +234,11 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertEqual(params["time"], "1785084000000")
         self.assertEqual(params["sign"], "04C45AADA8DB1411D694FCEF3D4B14DF")
 
+    def test_late_recheck_budget_scales_with_backlog(self):
+        self.assertEqual(self.scraper._calculate_late_recheck_limit(20), 4)
+        self.assertEqual(self.scraper._calculate_late_recheck_limit(363), 15)
+        self.assertEqual(self.scraper._calculate_late_recheck_limit(500), 16)
+
     def test_late_recheck_selection_respects_interval_and_discovery(self):
         self.scraper.conn = sqlite3.connect(":memory:")
         self.scraper.conn.execute("CREATE TABLE history (id TEXT PRIMARY KEY)")

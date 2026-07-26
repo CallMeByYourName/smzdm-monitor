@@ -46,7 +46,7 @@ The only runtime dependency is `requests`.
 - Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=50&hour=N`.
 - Ranking windows rotate through 1, 3, and 12 hours in 15-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
 - Bounded late rechecks use `https://haojia-api.smzdm.com/detail/{article_id}` to refresh active status, price, mall, direct product link, and current interaction counts after a candidate has left both discovery feeds.
-- Late rechecks select unsent snapshots no older than 18 hours when they previously had worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8. They exclude IDs found by the current main/rank scan, run at most four requests per scan, wait at least 45 minutes per article, and prioritize the least recently checked rows.
+- Late rechecks select unsent snapshots no older than 18 hours when they previously had worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8. They exclude IDs found by the current main/rank scan, use a backlog-scaled budget of 4–16 requests, wait at least 45 minutes per article, and prioritize never-checked rows nearest the age deadline before repeat checks.
 - `faxian/list` and `youhui/list` channel endpoints opportunistically enrich `article_link`, `mall_no`, and `product_no`.
 - `tongji_hudong` is preferred for comments, collection, worthy, and unworthy counts, with top-level fields as fallback.
 
@@ -130,7 +130,7 @@ Old JD lookup helpers remain behind the disabled flag. Do not enable hard reject
 - External detail/comment calls use randomized throttling.
 - HTTP 202/403/429, captcha markers, `probe.js`, or access-frequency responses suspend external checks for the rest of the run.
 - Two consecutive comment or late-detail request failures also open the run-local circuit breaker.
-- Late-detail traffic is capped at four requests per run and tracked independently in `late_recheck_state`; failure is diagnostic and does not stop main-feed discovery.
+- Late-detail traffic scales at 4% of the eligible backlog with a 4-request floor and 16-request hard cap. It is tracked independently in `late_recheck_state`; failure is diagnostic and does not stop main-feed discovery.
 
 Keep the external request count bounded. New sources should first reuse existing JSON endpoints, have strict timeouts, and degrade without blocking the full scan.
 
