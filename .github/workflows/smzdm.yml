@@ -89,44 +89,29 @@ jobs:
               WHERE article_id = '$DEBUG_ARTICLE_ID';
             "
             echo "Next eligible late-recheck rows:"
-            sqlite3 -header -column smzdm.db "
-              WITH latest AS (
-                SELECT article_id, MAX(captured_at) AS captured_at
-                FROM candidate_snapshots
-                WHERE article_id IS NOT NULL AND article_id != ''
-                GROUP BY article_id
+            python - <<'PY'
+          import os
+          import sqlite3
+          from smzdm import SmzdmScraper
+
+          scraper = SmzdmScraper.__new__(SmzdmScraper)
+          scraper.conn = sqlite3.connect("smzdm.db")
+          rows = scraper._select_late_recheck_rows(set(), 100000)
+          target = os.environ["DEBUG_ARTICLE_ID"]
+          target_position = next(
+              (position for position, row in enumerate(rows, start=1)
+               if row["article_id"] == target),
+              None,
+          )
+          print(f"eligible={len(rows)} target_position={target_position or '-'}")
+          for position, row in enumerate(rows[:20], start=1):
+              print(
+                  f"{position:>3} id={row['article_id']} score={row['composite_score']} "
+                  f"comments={row['comments']} collection={row['collection']} "
+                  f"worthy={row['worthy']} captured={row['captured_at']} "
+                  f"title={row['title']}"
               )
-              SELECT snapshots.article_id, snapshots.title,
-                     snapshots.worthy, snapshots.collection,
-                     snapshots.comments, snapshots.composite_score,
-                     snapshots.captured_at, recheck.last_checked
-              FROM latest
-              JOIN candidate_snapshots AS snapshots
-                ON snapshots.article_id = latest.article_id
-               AND snapshots.captured_at = latest.captured_at
-              LEFT JOIN history ON history.id = snapshots.article_id
-              LEFT JOIN late_recheck_state AS recheck
-                ON recheck.article_id = snapshots.article_id
-              WHERE history.id IS NULL
-                AND snapshots.captured_at <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-45 minutes')
-                AND COALESCE(recheck.retired, 0) = 0
-                AND (
-                      recheck.last_checked IS NULL
-                      OR recheck.last_checked <= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-45 minutes')
-                    )
-                AND (
-                      (snapshots.worthy >= 4 AND snapshots.collection >= 4)
-                      OR snapshots.worthy >= 6
-                      OR snapshots.comments >= 8
-                    )
-                AND (
-                      (julianday('now') - julianday(snapshots.captured_at)) * 24
-                      + COALESCE(snapshots.age_hours, 0)
-                    ) <= 18
-              ORDER BY COALESCE(recheck.last_checked, snapshots.captured_at) ASC,
-                       snapshots.composite_score DESC
-              LIMIT 20;
-            "
+          PY
           fi
 
       - name: Run scraper
