@@ -51,7 +51,7 @@ jobs:
           fi
           echo "Candidate snapshots for article $DEBUG_ARTICLE_ID:"
           sqlite3 -header -column smzdm.db "
-            SELECT article_id, snapshot_key, title, worthy, collection,
+            SELECT article_id, item_key, title, worthy, collection,
                    comments, unworthy, captured_at
             FROM candidate_snapshots
             WHERE article_id = '$DEBUG_ARTICLE_ID'
