@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       debug_article_id:
-        description: '可选：查询指定文章 ID 的候选快照'
+        description: '可选：查询指定文章 ID 的候选快照和推送历史'
         required: false
         type: string
   repository_dispatch:
@@ -57,6 +57,26 @@ jobs:
             FROM candidate_snapshots
             WHERE article_id = '$DEBUG_ARTICLE_ID'
             ORDER BY captured_at;
+          "
+          echo "Matching successful-push history:"
+          sqlite3 -header -column smzdm.db "
+            SELECT id, title, fingerprint, product_key, mall, price,
+                   price_value, last_seen
+            FROM history
+            WHERE id = '$DEBUG_ARTICLE_ID'
+               OR fingerprint IN (
+                    SELECT fingerprint
+                    FROM candidate_snapshots
+                    WHERE article_id = '$DEBUG_ARTICLE_ID'
+                      AND fingerprint IS NOT NULL AND fingerprint != ''
+               )
+               OR product_key IN (
+                    SELECT product_key
+                    FROM candidate_snapshots
+                    WHERE article_id = '$DEBUG_ARTICLE_ID'
+                      AND product_key IS NOT NULL AND product_key != ''
+               )
+            ORDER BY last_seen DESC;
           "
 
       - name: Run scraper

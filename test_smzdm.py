@@ -1,4 +1,6 @@
 import unittest
+import sqlite3
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from smzdm import CONFIG, SmzdmScraper
@@ -195,6 +197,111 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertEqual(parsed["worthy"], 14)
         self.assertEqual(parsed["rank_position"], 16)
 
+    def test_late_detail_maps_real_article_metrics_and_qualifies(self):
+        detail = {
+            "article_id": "179285386",
+            "channel_name": "youhui",
+            "article_title": "今日必买：乐视 D50CFCN8 全高清HDR 50英寸液晶电视机 标配",
+            "article_price": "799元（需用券）",
+            "article_url": "https://www.smzdm.com/p/179285386/",
+            "article_mall": "京东",
+            "article_mall_id": "183",
+            "article_pubdate": "2026-07-26 10:31:38",
+            "article_status": "0",
+            "article_collection": "35",
+            "article_comment": "23",
+            "article_worthy": "18",
+            "article_unworthy": "2",
+            "dingyue_product_url": "https://item.jd.com/10092665428574.html",
+        }
+
+        parsed = self.scraper._parse_late_recheck_detail(detail)
+
+        self.assertEqual(parsed["comments"], 23)
+        self.assertEqual(parsed["collection"], 35)
+        self.assertEqual(parsed["worthy"], 18)
+        self.assertEqual(parsed["unworthy"], 2)
+        self.assertEqual(parsed["product_key"], "183:10092665428574")
+        self.assertEqual(parsed["pub_time"], "2026-07-26 10:31:38")
+        parsed["trend_metrics"] = self.scraper._empty_trend_metrics()
+        self.assertTrue(self.scraper._filter_stage1(parsed))
+        self.assertEqual(parsed["quality_path"], "高讨论")
+        self.assertEqual(parsed["score_rate"], 90)
+        self.assertEqual(parsed["composite_score"], 157)
+
+    def test_late_detail_signature_is_deterministic(self):
+        params = self.scraper._build_detail_api_params(now_ms=1785084000000)
+        self.assertEqual(params["time"], "1785084000000")
+        self.assertEqual(params["sign"], "04C45AADA8DB1411D694FCEF3D4B14DF")
+
+    def test_late_recheck_selection_respects_interval_and_discovery(self):
+        self.scraper.conn = sqlite3.connect(":memory:")
+        self.scraper.conn.execute("CREATE TABLE history (id TEXT PRIMARY KEY)")
+        self.scraper.conn.execute(
+            """
+            CREATE TABLE candidate_snapshots (
+                article_id TEXT, title TEXT, worthy INTEGER, collection INTEGER,
+                comments INTEGER, composite_score INTEGER, age_hours REAL,
+                captured_at TEXT
+            )
+            """
+        )
+        self.scraper.conn.execute(
+            """
+            CREATE TABLE late_recheck_state (
+                article_id TEXT PRIMARY KEY, last_checked TEXT NOT NULL,
+                retired INTEGER DEFAULT 0
+            )
+            """
+        )
+        old = (datetime.utcnow() - timedelta(hours=2)).isoformat(timespec="seconds")
+        recent = datetime.utcnow().isoformat(timespec="seconds")
+        rows = [
+            ("1", "刚复查", 6, 8, 0, 22, 2, old),
+            ("2", "应复查", 4, 5, 0, 14, 2, old),
+            ("3", "本轮已发现", 7, 8, 0, 23, 2, old),
+            ("4", "已推送", 8, 8, 0, 24, 2, old),
+        ]
+        self.scraper.conn.executemany(
+            "INSERT INTO candidate_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.scraper.conn.execute(
+            "INSERT INTO late_recheck_state VALUES (?, ?, 0)", ("1", recent)
+        )
+        self.scraper.conn.execute("INSERT INTO history VALUES ('4')")
+
+        selected = self.scraper._select_late_recheck_rows({"3"}, 4)
+
+        self.assertEqual([row["article_id"] for row in selected], ["2"])
+
+    def test_late_detail_failures_trip_optional_external_circuit_breaker(self):
+        class Response:
+            status_code = 500
+            headers = {}
+            text = ""
+
+        class Session:
+            @staticmethod
+            def get(*args, **kwargs):
+                return Response()
+
+        self.scraper.session = Session()
+        self.scraper._throttle_external_request = lambda: None
+        self.scraper.external_checks_suspended = False
+        self.scraper.consecutive_detail_request_failures = 0
+        self.scraper.stats = {
+            "total_late_recheck_attempted": 0,
+            "total_late_recheck_unavailable": 0,
+            "total_external_checks_suspended": 0,
+        }
+
+        self.assertIsNone(self.scraper._fetch_late_recheck_detail("1"))
+        self.assertFalse(self.scraper.external_checks_suspended)
+        self.assertIsNone(self.scraper._fetch_late_recheck_detail("2"))
+        self.assertTrue(self.scraper.external_checks_suspended)
+        self.assertEqual(self.scraper.stats["total_late_recheck_unavailable"], 2)
+
     def test_rank_source_does_not_bypass_low_score_rate(self):
         parsed = {
             "title": "富德 FG87 三模机械键盘",
@@ -254,6 +361,7 @@ class SmzdmFilterTests(unittest.TestCase):
         self.scraper._fetch_rank_rows = lambda: []
         self.scraper._fetch_page = lambda page: calls.append(page)
         self.scraper._commit_candidate_snapshots = lambda: None
+        self.scraper._append_late_recheck_candidates = lambda discovered, candidates: None
         self.scraper.stats = {
             "total_fetched": 0,
             "total_page_request_failures": 0,

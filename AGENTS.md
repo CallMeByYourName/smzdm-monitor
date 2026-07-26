@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-07-26`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
+This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-07-27`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
 ## Project Overview
 
@@ -45,6 +45,8 @@ The only runtime dependency is `requests`.
 - The main scan reads at most 51 pages, 5100 rows, and six hours of `faxian`/`youhui` items. The live API currently returns no rows beyond offset 5000. At busy times the row cap, not the six-hour cap, determines coverage.
 - Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=50&hour=N`.
 - Ranking windows rotate through 1, 3, and 12 hours in 15-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
+- Bounded late rechecks use `https://haojia-api.smzdm.com/detail/{article_id}` to refresh active status, price, mall, direct product link, and current interaction counts after a candidate has left both discovery feeds.
+- Late rechecks select unsent snapshots no older than 18 hours when they previously had worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8. They exclude IDs found by the current main/rank scan, run at most four requests per scan, wait at least 45 minutes per article, and prioritize the least recently checked rows.
 - `faxian/list` and `youhui/list` channel endpoints opportunistically enrich `article_link`, `mall_no`, and `product_no`.
 - `tongji_hudong` is preferred for comments, collection, worthy, and unworthy counts, with top-level fields as fallback.
 
@@ -82,6 +84,8 @@ There is no broad category or keyword blacklist. The title filter is intentional
 - `超级好价` and `高讨论` are exempt from the slow-growth rejection; exact exemption lists are in `CONFIG`.
 
 Filtered and failed-push items are not written to `history`, so later scans can reevaluate them as engagement changes.
+
+Candidates can leave the feed before delayed comments and collections appear. `candidate_snapshots` therefore also seed the bounded late-recheck queue. Refreshed detail rows still pass every normal title, quality, trend, comment, anomaly, and deduplication stage; detail membership is not a bypass. Inactive rows are retired from the queue.
 
 ## Comment Checks
 
@@ -125,7 +129,8 @@ Old JD lookup helpers remain behind the disabled flag. Do not enable hard reject
 - Main-feed scanning stops after three consecutive failed pages and leaves recovery to the next scheduled run.
 - External detail/comment calls use randomized throttling.
 - HTTP 202/403/429, captcha markers, `probe.js`, or access-frequency responses suspend external checks for the rest of the run.
-- Two consecutive comment request failures also open the run-local circuit breaker.
+- Two consecutive comment or late-detail request failures also open the run-local circuit breaker.
+- Late-detail traffic is capped at four requests per run and tracked independently in `late_recheck_state`; failure is diagnostic and does not stop main-feed discovery.
 
 Keep the external request count bounded. New sources should first reuse existing JSON endpoints, have strict timeouts, and degrade without blocking the full scan.
 
@@ -133,7 +138,7 @@ Keep the external request count bounded. New sources should first reuse existing
 
 `.github/workflows/smzdm.yml` accepts `workflow_dispatch` and `repository_dispatch` with event type `cron_trigger`. cron-job.org currently sends the external trigger every 15 minutes. There is deliberately no GitHub `schedule`, which avoids double triggering.
 
-Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID and prints matching `candidate_snapshots` rows before the scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
+Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID and prints matching `candidate_snapshots` plus successful-push history for the same ID, SKU, or fingerprint before the scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
 
 The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
 

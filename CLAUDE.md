@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-26`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-27`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
 ## Project
 
@@ -23,6 +23,7 @@ python3 -m unittest -v
 - Main source: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
 - Scan cap: 51 pages, 5100 rows, six hours, and only `faxian`/`youhui` channels. At peak volume the API row cap is reached before the time cap.
 - Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, returning up to 50 rows while 1-hour, 3-hour, and 12-hour windows rotate every 15 minutes. Ranking items still pass all normal filters.
+- Late-detail source: up to four signed JSON requests per run to `https://haojia-api.smzdm.com/detail/{article_id}`. It refreshes previously near-threshold, unsent candidates after they leave the feeds, with an 18-hour horizon and a 45-minute per-article interval. Current-feed/rank IDs are excluded.
 - `faxian/list` and `youhui/list` enrich `article_link`, `mall_no`, and `product_no` when present.
 - `tongji_hudong` supplies the preferred comment, collection, worthy, and unworthy counts.
 
@@ -58,6 +59,8 @@ The script has no broad category blacklist. Its narrow normalized-regex filter t
 
 Filtered or failed-push items do not enter push history, so they remain eligible for later reevaluation.
 
+Snapshots with worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8 can seed the bounded late-recheck queue. Refreshed rows do not bypass any normal filter. Inactive details are retired, and `late_recheck_state` provides fair rotation without altering trend history.
+
 ## Comments
 
 Comment samples use `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`. This is normally a hot/related module, not full pagination. Author comments are excluded, and the module total may upgrade the list comment count.
@@ -80,11 +83,11 @@ Only successful pushes are recorded. Dedup uses article ID, platform product key
 
 ## Stability and Deployment
 
-Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment failures suspend external checks for the rest of that run.
+Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment/late-detail failures suspend external checks for the rest of that run. Late-detail failures do not stop main-feed discovery and recover on the next scheduled run.
 
 `.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, and `actions/cache` for SQLite.
 
-Manual runs accept optional `debug_article_id`; the workflow prints that article's cached candidate snapshots before scanning. Use it to investigate missing items from real stored metrics.
+Manual runs accept optional `debug_article_id`; the workflow prints that article's cached candidate snapshots and matching successful-push history before scanning. Use it to investigate missing items from real stored metrics.
 
 `actions/cache` is not transactional state. Closely spaced or retried runs may restore an older database, so the current system cannot promise exactly-once notifications.
 

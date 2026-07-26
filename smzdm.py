@@ -12,6 +12,7 @@ import logging
 import re
 import html
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -22,6 +23,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "")
 UID = os.environ.get("WXPUSHER_UID", "")
 DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
+SMZDM_DETAIL_SIGN_KEY = "apr1$AwP!wRRT$gJ/q.X24poeBInlUJC"
 
 CONFIG = {
     # 扫描参数
@@ -35,6 +37,17 @@ CONFIG = {
     "rank_source_hours": [1, 3, 12],   # 配合 15 分钟触发轮换短期、升温和成熟榜单
     "rank_source_slot_seconds": 900,
     "rank_source_limit": 50,           # 接口单次最多返回 50 条，仍只请求一次总榜
+    "late_recheck_enabled": True,       # 主列表消失后，用按文章 ID 的详情 JSON 补查审核延迟的互动
+    "late_recheck_url": "https://haojia-api.smzdm.com/detail/{article_id}",
+    "late_recheck_limit": 4,            # 每轮最多 4 条，避免历史候选形成外部请求洪峰
+    "late_recheck_interval_minutes": 45,
+    "late_recheck_max_age_hours": 18,
+    "late_recheck_min_worthy": 4,
+    "late_recheck_min_collection": 4,
+    "late_recheck_min_comments": 8,
+    "detail_api_version": "10.4.26",
+    "detail_api_revision": "866",
+    "max_consecutive_detail_failures": 2,
 
     # 第一阶段：综合评分筛选
     "score_weights": {
@@ -296,6 +309,12 @@ class SmzdmScraper:
             'total_rank_duplicates': 0,
             'total_rank_filtered_title': 0,
             'total_rank_filtered_stage1': 0,
+            'total_late_recheck_selected': 0,
+            'total_late_recheck_attempted': 0,
+            'total_late_recheck_fetched': 0,
+            'total_late_recheck_candidates': 0,
+            'total_late_recheck_unavailable': 0,
+            'total_late_recheck_filtered_stage1': 0,
             'total_sent': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
@@ -343,6 +362,7 @@ class SmzdmScraper:
         self.comment_level_check_limit = CONFIG['comment_level_check_min_per_run']
         self.external_checks_suspended = False
         self.consecutive_comment_request_failures = 0
+        self.consecutive_detail_request_failures = 0
         self.snapshot_keys_seen_this_run = set()
         self.pending_snapshot_writes = 0
 
@@ -430,6 +450,13 @@ class SmzdmScraper:
             'CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_article_time '
             'ON candidate_snapshots (article_id, captured_at)'
         )
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS late_recheck_state (
+                article_id TEXT PRIMARY KEY,
+                last_checked TEXT NOT NULL,
+                retired INTEGER DEFAULT 0
+            )
+        ''')
         self.conn.commit()
 
     def _ensure_history_columns(self):
@@ -657,14 +684,18 @@ class SmzdmScraper:
             self._commit_candidate_snapshots()
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
+        discovered_ids = set(processed_ids)
         for position, row in enumerate(rank_rows, start=1):
             article_id = str(row.get('article_id', '')).strip()
+            if article_id:
+                discovered_ids.add(article_id)
             if not article_id or article_id in processed_ids:
                 continue
             parsed = self._parse_rank_item(row, position)
             if parsed:
                 self._consider_stage1_candidate(parsed, candidates)
 
+        self._append_late_recheck_candidates(discovered_ids, candidates)
         self._commit_candidate_snapshots()
         return candidates
 
@@ -690,6 +721,8 @@ class SmzdmScraper:
 
         if not self._filter_stage1(parsed):
             self.stats['total_filtered_stage1'] += 1
+            if parsed.get('late_recheck_source'):
+                self.stats['total_late_recheck_filtered_stage1'] += 1
             if parsed.get('rank_source'):
                 self.stats['total_rank_filtered_stage1'] += 1
                 metrics = self._current_interaction_metrics(parsed)
@@ -704,6 +737,13 @@ class SmzdmScraper:
 
         candidates.append(parsed)
         self.seen_ids.add(parsed['id'])
+        if parsed.get('late_recheck_source'):
+            self.stats['total_late_recheck_candidates'] += 1
+            logging.info(
+                f"[延迟复查候选] {parsed['title'][:40]}... | "
+                f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
+                f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
+            )
         if parsed.get('rank_source'):
             self.stats['total_rank_candidates'] += 1
             logging.info(
@@ -760,6 +800,276 @@ class SmzdmScraper:
         slot_seconds = max(1, int(CONFIG.get('rank_source_slot_seconds') or 1800))
         slot = int((time.time() if now_ts is None else now_ts) // slot_seconds)
         return int(hours[slot % len(hours)])
+
+    def _append_late_recheck_candidates(self, discovered_ids, candidates):
+        if not CONFIG.get('late_recheck_enabled') or self.external_checks_suspended:
+            return
+
+        limit = max(0, int(CONFIG.get('late_recheck_limit', 0)))
+        if limit <= 0:
+            return
+
+        rows = self._select_late_recheck_rows(discovered_ids, limit)
+        self.stats['total_late_recheck_selected'] += len(rows)
+        for row in rows:
+            if self.external_checks_suspended:
+                break
+            article_id = str(row.get('article_id') or '').strip()
+            self._mark_late_recheck(article_id)
+            detail = self._fetch_late_recheck_detail(article_id)
+            if not detail:
+                continue
+            parsed = self._parse_late_recheck_detail(detail)
+            if not parsed:
+                continue
+            if self._is_inactive_deal(parsed):
+                self._mark_late_recheck(article_id, retired=True)
+                logging.info(f"[延迟复查退出] article_id:{article_id} 已失效")
+                continue
+            self._consider_stage1_candidate(parsed, candidates)
+
+    def _select_late_recheck_rows(self, discovered_ids, limit):
+        interval_minutes = max(1, int(CONFIG.get('late_recheck_interval_minutes', 45)))
+        max_age_hours = max(1, float(CONFIG.get('late_recheck_max_age_hours', 18)))
+        cutoff = datetime.utcnow() - timedelta(minutes=interval_minutes)
+        pool_limit = max(limit * 5, limit)
+        cursor = self.conn.execute(
+            '''
+            WITH latest AS (
+                SELECT article_id, MAX(captured_at) AS captured_at
+                FROM candidate_snapshots
+                WHERE article_id IS NOT NULL AND article_id != ''
+                GROUP BY article_id
+            )
+            SELECT snapshots.article_id, snapshots.title, snapshots.worthy,
+                   snapshots.collection, snapshots.comments,
+                   snapshots.composite_score, snapshots.age_hours,
+                   snapshots.captured_at
+            FROM latest
+            JOIN candidate_snapshots AS snapshots
+              ON snapshots.article_id = latest.article_id
+             AND snapshots.captured_at = latest.captured_at
+            LEFT JOIN history ON history.id = snapshots.article_id
+            LEFT JOIN late_recheck_state AS recheck
+              ON recheck.article_id = snapshots.article_id
+            WHERE history.id IS NULL
+              AND snapshots.captured_at <= ?
+              AND COALESCE(recheck.retired, 0) = 0
+              AND (recheck.last_checked IS NULL OR recheck.last_checked <= ?)
+              AND (
+                    (snapshots.worthy >= ? AND snapshots.collection >= ?)
+                    OR snapshots.worthy >= ?
+                    OR snapshots.comments >= ?
+                  )
+              AND (
+                    (julianday('now') - julianday(snapshots.captured_at)) * 24
+                    + COALESCE(snapshots.age_hours, 0)
+                  ) <= ?
+            ORDER BY COALESCE(recheck.last_checked, snapshots.captured_at) ASC,
+                     snapshots.composite_score DESC
+            LIMIT ?
+            ''',
+            (
+                cutoff.isoformat(timespec='seconds'),
+                cutoff.isoformat(timespec='seconds'),
+                CONFIG['late_recheck_min_worthy'],
+                CONFIG['late_recheck_min_collection'],
+                CONFIG['early_signal_min_worthy'],
+                CONFIG['late_recheck_min_comments'],
+                max_age_hours,
+                pool_limit,
+            )
+        )
+        excluded = {str(value) for value in (discovered_ids or set())}
+        selected = set()
+        rows = []
+        for row in cursor.fetchall():
+            article_id = str(row[0] or '').strip()
+            if not article_id or article_id in excluded or article_id in selected:
+                continue
+            selected.add(article_id)
+            rows.append({
+                'article_id': article_id,
+                'title': row[1],
+                'worthy': self._safe_nonnegative_int(row[2]),
+                'collection': self._safe_nonnegative_int(row[3]),
+                'comments': self._safe_nonnegative_int(row[4]),
+                'composite_score': self._safe_nonnegative_int(row[5]),
+                'age_hours': float(row[6] or 0),
+                'captured_at': row[7],
+            })
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def _mark_late_recheck(self, article_id, retired=False):
+        self.conn.execute(
+            '''
+            INSERT INTO late_recheck_state (article_id, last_checked, retired)
+            VALUES (?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET
+                last_checked = excluded.last_checked,
+                retired = MAX(late_recheck_state.retired, excluded.retired)
+            ''',
+            (
+                str(article_id),
+                datetime.utcnow().isoformat(timespec='seconds'),
+                1 if retired else 0,
+            )
+        )
+        self.pending_snapshot_writes += 1
+
+    @staticmethod
+    def _build_detail_api_params(now_ms=None):
+        params = {
+            'weixin': 1,
+            'basic_v': 0,
+            'f': 'android',
+            'v': CONFIG['detail_api_version'],
+            'time': str(int(time.time() * 1000) if now_ms is None else int(now_ms)),
+            'imgmode': 0,
+            'hashcode': '',
+            'h5hash': '',
+        }
+        sign_parts = []
+        for key in sorted(params):
+            if params[key] == '':
+                continue
+            value = re.sub(r'\s+', '', str(params[key]))
+            sign_parts.append(f"{key}={value}")
+        sign_data = '&'.join(sign_parts)
+        params['sign'] = hashlib.md5(
+            f"{sign_data}&key={SMZDM_DETAIL_SIGN_KEY}".encode('utf-8')
+        ).hexdigest().upper()
+        return params
+
+    def _fetch_late_recheck_detail(self, article_id):
+        if not article_id or self.external_checks_suspended:
+            return None
+
+        self.stats['total_late_recheck_attempted'] += 1
+        url = CONFIG['late_recheck_url'].format(article_id=article_id)
+        version = CONFIG['detail_api_version']
+        revision = CONFIG['detail_api_revision']
+        try:
+            self._throttle_external_request()
+            response = self.session.get(
+                url,
+                params=self._build_detail_api_params(),
+                headers={
+                    'Accept': '*/*',
+                    'Accept-Language': 'zh-Hans-CN;q=1',
+                    'request_key': ''.join(random.choice('0123456789') for _ in range(18)),
+                    'User-Agent': (
+                        f"smzdm_android_V{version} rv:{revision} "
+                        "(Redmi Note 3;Android10.0;zh)smzdmapp"
+                    ),
+                    'Referer': f'https://www.smzdm.com/p/{article_id}/',
+                },
+                timeout=CONFIG['timeout'],
+            )
+            if self._is_waf_response(response):
+                self.stats['total_late_recheck_unavailable'] += 1
+                self._suspend_external_checks("延迟复查详情接口触发反爬/验证码")
+                return None
+            if response.status_code != 200:
+                self._record_late_recheck_failure(f"HTTP {response.status_code}")
+                return None
+            payload = response.json()
+            data = payload.get('data') if isinstance(payload, dict) else None
+            if str(payload.get('error_code')) != '0' or not isinstance(data, dict):
+                reason = payload.get('error_msg') if isinstance(payload, dict) else 'invalid JSON'
+                self._record_late_recheck_failure(reason or 'invalid response')
+                return None
+        except Exception as e:
+            self._record_late_recheck_failure(type(e).__name__)
+            return None
+
+        self.consecutive_detail_request_failures = 0
+        self.stats['total_late_recheck_fetched'] += 1
+        return data
+
+    def _record_late_recheck_failure(self, reason):
+        self.stats['total_late_recheck_unavailable'] += 1
+        self.consecutive_detail_request_failures += 1
+        logging.warning(f"延迟复查详情接口不可用: {reason}")
+        limit = max(1, int(CONFIG.get('max_consecutive_detail_failures', 2)))
+        if self.consecutive_detail_request_failures >= limit:
+            self._suspend_external_checks(
+                f"延迟复查详情接口连续 {self.consecutive_detail_request_failures} 次失败（{reason}）"
+            )
+
+    def _parse_late_recheck_detail(self, data):
+        article_id = str(data.get('article_id') or '').strip()
+        title = str(data.get('article_title') or '').strip()[:200]
+        channel_type = str(
+            data.get('channel_name') or data.get('gtm_channel_name') or ''
+        ).strip()
+        if not article_id or not title:
+            return None
+        whitelist = CONFIG.get('whitelist_channel_types')
+        if whitelist and channel_type not in whitelist:
+            return None
+
+        mall = str(data.get('article_mall') or '未知').strip()
+        mall_no = str(data.get('article_mall_id') or '').strip()
+        article_link = str(data.get('dingyue_product_url') or '').strip()
+        product_no = ''
+        product_match = re.search(r'item\.jd\.com/(\d+)', article_link)
+        if product_match:
+            product_no = product_match.group(1)
+
+        article_status = str(data.get('article_status') or '').strip()
+        parsed = {
+            'id': article_id,
+            'title': title,
+            'price': str(data.get('article_price') or '未知').strip(),
+            'link': str(
+                data.get('article_url') or f'https://www.smzdm.com/p/{article_id}/'
+            ).strip(),
+            'article_link': article_link,
+            'channel_type': channel_type,
+            'mall': mall,
+            'mall_no': mall_no,
+            'product_no': product_no,
+            'product_key': '',
+            'pub_time': str(
+                data.get('article_format_date') or data.get('article_pubdate') or ''
+            ).strip(),
+            'comments': self._safe_nonnegative_int(data.get('article_comment')),
+            'collection': self._safe_nonnegative_int(data.get('article_collection')),
+            'worthy': self._safe_nonnegative_int(data.get('article_worthy')),
+            'unworthy': self._safe_nonnegative_int(data.get('article_unworthy')),
+            'age_hours': self._detail_age_hours(data),
+            'fingerprint': self._build_title_fingerprint(title),
+            'price_value': self._parse_price_value(data.get('article_price', '')),
+            'is_sold_out': self._truthy_field(
+                data.get('article_is_sold_out') or data.get('article_stock_status')
+            ),
+            'is_timeout': article_status not in ('', '0'),
+            'status_text': str(data.get('article_status_name') or '').strip(),
+            'late_recheck_source': True,
+        }
+        parsed['product_key'] = self._build_product_key(parsed)
+        return parsed
+
+    @staticmethod
+    def _detail_age_hours(data):
+        china_tz = timezone(timedelta(hours=8))
+        for field in ('article_date', 'article_pubdate'):
+            value = str(data.get(field) or '').strip()
+            if not value:
+                continue
+            try:
+                article_time = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                continue
+            article_time = article_time.replace(tzinfo=china_tz)
+            return max(
+                0,
+                (datetime.now(timezone.utc) - article_time).total_seconds() / 3600,
+            )
+        return 0
 
     def _parse_rank_item(self, row, position):
         mapped = {
@@ -3058,6 +3368,11 @@ class SmzdmScraper:
             (snapshot_cutoff.isoformat(timespec='seconds'),)
         )
         snapshot_deleted = snapshot_cursor.rowcount
+        recheck_cursor = self.conn.execute(
+            "DELETE FROM late_recheck_state WHERE last_checked < ?",
+            (snapshot_cutoff.isoformat(timespec='seconds'),)
+        )
+        recheck_deleted = recheck_cursor.rowcount
 
         self.conn.commit()
         if deleted > 0:
@@ -3066,6 +3381,8 @@ class SmzdmScraper:
             logging.info(f"清理 {pending_deleted} 条过期待复评记录")
         if snapshot_deleted > 0:
             logging.info(f"清理 {snapshot_deleted} 条过期候选快照")
+        if recheck_deleted > 0:
+            logging.info(f"清理 {recheck_deleted} 条过期延迟复查状态")
 
     # ==================== 辅助 ====================
 
@@ -3080,6 +3397,12 @@ class SmzdmScraper:
         logging.info(f"  排行榜重复跳过: {self.stats['total_rank_duplicates']}")
         logging.info(f"  排行榜标题过滤: {self.stats['total_rank_filtered_title']}")
         logging.info(f"  排行榜评分过滤: {self.stats['total_rank_filtered_stage1']}")
+        logging.info(f"  延迟复查选中: {self.stats['total_late_recheck_selected']}")
+        logging.info(f"  延迟复查请求: {self.stats['total_late_recheck_attempted']}")
+        logging.info(f"  延迟复查获取: {self.stats['total_late_recheck_fetched']}")
+        logging.info(f"  延迟复查候选: {self.stats['total_late_recheck_candidates']}")
+        logging.info(f"  延迟复查不可用: {self.stats['total_late_recheck_unavailable']}")
+        logging.info(f"  延迟复查评分过滤: {self.stats['total_late_recheck_filtered_stage1']}")
         logging.info(f"  频道元数据补充: {self.stats['total_channel_metadata_enriched']}")
         logging.info(f"  详情评论数更新: {self.stats['total_comment_count_upgraded']}")
         logging.info(f"  候选快照保存: {self.stats['total_candidate_snapshots_saved']}")
