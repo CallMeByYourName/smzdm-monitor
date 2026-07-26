@@ -11,12 +11,13 @@ class SmzdmFilterTests(unittest.TestCase):
 
     def test_main_feed_uses_api_page_limit_without_reducing_scan_budget(self):
         self.assertEqual(CONFIG["items_per_page"], 100)
-        self.assertEqual(CONFIG["items_per_page"] * CONFIG["max_pages"], 4000)
+        self.assertEqual(CONFIG["items_per_page"] * CONFIG["max_pages"], 5100)
 
     def test_rank_windows_alternate_without_increasing_requests(self):
-        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=0), 3)
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=0), 1)
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=900), 3)
         self.assertEqual(self.scraper._select_rank_source_hour(now_ts=1800), 12)
-        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=3600), 3)
+        self.assertEqual(self.scraper._select_rank_source_hour(now_ts=2700), 1)
 
     def test_task_title_variants_are_blocked(self):
         blocked_titles = [
@@ -78,6 +79,7 @@ class SmzdmFilterTests(unittest.TestCase):
             "vivo X300福袋 购买后参加三个活动 非必中",
             "京东关注有礼（1）个豆子",
             "值友专享：深夜游乐场，满18续摊～",
+            "洋河京东自营旗舰店，会员页下拉找到加购有礼，加购4件商品（20）京豆",
         ]
         for title in blocked_titles:
             with self.subTest(title=title):
@@ -244,6 +246,7 @@ class SmzdmFilterTests(unittest.TestCase):
         rows = self.scraper._fetch_rank_rows()
         self.assertEqual(len(Session.calls), 1)
         self.assertEqual(Session.calls[0][1]["params"]["hour"], 3)
+        self.assertEqual(Session.calls[0][1]["params"]["limit"], 50)
         self.assertEqual(rows[0]["_rank_window_hours"], 3)
 
     def test_main_scan_stops_after_consecutive_page_failures(self):
@@ -432,6 +435,53 @@ class SmzdmFilterTests(unittest.TestCase):
         }
         self.assertTrue(self.scraper._filter_stage1(parsed))
         self.assertTrue(self.scraper._should_wait_for_trend_confirmation(parsed))
+
+    def test_single_unworthy_does_not_veto_confirmed_early_growth(self):
+        trend = self.scraper._empty_trend_metrics()
+        trend.update({
+            "snapshot_count": 3,
+            "recent_minutes": 15,
+            "elapsed_minutes": 45,
+            "recent_growth_score": 14,
+            "growth_score": 20,
+            "recent_signal_growth_score": 10,
+            "signal_growth_score": 10,
+            "recent_delta_worthy": 2,
+            "delta_worthy": 2,
+            "recent_growth_per_hour": 56,
+            "growth_per_hour": 27,
+        })
+        parsed = {
+            "title": "今日必买：TCL 超旋风V3R系列 G100V3R-HB 洗烘一体机 10kg",
+            "comments": 7,
+            "collection": 4,
+            "worthy": 6,
+            "unworthy": 1,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": trend,
+        }
+
+        self.assertTrue(self.scraper._filter_stage1(parsed))
+        self.assertEqual(parsed["quality_path"], "早期好价")
+        self.assertEqual(parsed["score_rate"], 86)
+        self.assertFalse(self.scraper._should_wait_for_trend_confirmation(parsed))
+
+    def test_multiple_unworthy_votes_still_fail_strict_early_rate(self):
+        parsed = {
+            "title": "测试低好评率商品",
+            "comments": 8,
+            "collection": 5,
+            "worthy": 8,
+            "unworthy": 2,
+            "is_sold_out": False,
+            "is_timeout": False,
+            "status_text": "",
+            "trend_metrics": self.scraper._empty_trend_metrics(),
+        }
+
+        self.assertFalse(self.scraper._filter_stage1(parsed))
 
 
 if __name__ == "__main__":

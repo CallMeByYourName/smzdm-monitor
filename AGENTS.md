@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-07-20`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
+This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-07-26`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
 ## Project Overview
 
@@ -42,9 +42,9 @@ The only runtime dependency is `requests`.
 ## Data Sources
 
 - Main feed: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
-- The main scan reads at most 40 pages, 4000 rows, and six hours of `faxian`/`youhui` items.
-- Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=20&hour=N`.
-- Ranking windows alternate between 3 and 12 hours in 30-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
+- The main scan reads at most 51 pages, 5100 rows, and six hours of `faxian`/`youhui` items. The live API currently returns no rows beyond offset 5000. At busy times the row cap, not the six-hour cap, determines coverage.
+- Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=50&hour=N`.
+- Ranking windows rotate through 1, 3, and 12 hours in 15-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
 - `faxian/list` and `youhui/list` channel endpoints opportunistically enrich `article_link`, `mall_no`, and `product_no`.
 - `tongji_hudong` is preferred for comments, collection, worthy, and unworthy counts, with top-level fields as fallback.
 
@@ -64,6 +64,8 @@ Stage 1 has six paths:
 - `早期好价`: worthy >= 4, comments >= 6, collection >= 4, total engagement >= 16, score >= 35, score rate >= 95%.
 - `早期强信号`: worthy >= 6, collection >= 8, total engagement >= 16, score >= 28, score rate >= 95%.
 - `升温好价`: worthy >= 4, collection >= 4, total engagement >= 15, score >= 32, score rate >= 95%, plus qualifying snapshot growth with at least one new worthy vote.
+
+Balanced, early, and warming paths have one controlled score-rate exception: at least six worthy votes, no more than one unworthy vote, and score rate >= 85%. Every other path threshold still applies. This prevents a single negative vote from vetoing a fast-growing `6:1` sample while retaining the global 85% floor; two negative votes do not receive this exception.
 
 All paths require at least two worthy votes or two comments. Sold-out, timed-out, expired, and ended items are rejected.
 
@@ -130,6 +132,8 @@ Keep the external request count bounded. New sources should first reuse existing
 ## Deployment
 
 `.github/workflows/smzdm.yml` accepts `workflow_dispatch` and `repository_dispatch` with event type `cron_trigger`. cron-job.org currently sends the external trigger every 15 minutes. There is deliberately no GitHub `schedule`, which avoids double triggering.
+
+Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID and prints matching `candidate_snapshots` rows before the scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
 
 The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
 

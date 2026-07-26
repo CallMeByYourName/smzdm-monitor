@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-20`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-26`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
 ## Project
 
@@ -21,8 +21,8 @@ python3 -m unittest -v
 ## Inputs and Scan Scope
 
 - Main source: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
-- Scan cap: 40 pages, 4000 rows, six hours, and only `faxian`/`youhui` channels.
-- Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, with 3-hour and 12-hour windows alternating every 30 minutes. Ranking items still pass all normal filters.
+- Scan cap: 51 pages, 5100 rows, six hours, and only `faxian`/`youhui` channels. At peak volume the API row cap is reached before the time cap.
+- Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, returning up to 50 rows while 1-hour, 3-hour, and 12-hour windows rotate every 15 minutes. Ranking items still pass all normal filters.
 - `faxian/list` and `youhui/list` enrich `article_link`, `mall_no`, and `product_no` when present.
 - `tongji_hudong` supplies the preferred comment, collection, worthy, and unworthy counts.
 
@@ -40,6 +40,8 @@ comments * 3 + collection * 2 + worthy
 - `早期好价`: worthy >= 4, comments >= 6, collection >= 4, engagement >= 16, score >= 35, score rate >= 95%.
 - `早期强信号`: worthy >= 6, collection >= 8, engagement >= 16, score >= 28, score rate >= 95%.
 - `升温好价`: worthy >= 4, collection >= 4, engagement >= 15, score >= 32, score rate >= 95%, plus qualifying snapshot growth with at least one new worthy vote.
+
+Balanced, early, and warming paths tolerate one unworthy vote only when worthy >= 6 and the resulting score rate remains >= 85%. This is a narrow exception to the stricter path rate, not a global threshold reduction; all count, score, and trend requirements remain.
 
 All paths require at least two worthy votes or two comments. Inactive items are rejected.
 
@@ -81,6 +83,8 @@ Only successful pushes are recorded. Dedup uses article ID, platform product key
 Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment failures suspend external checks for the rest of that run.
 
 `.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, and `actions/cache` for SQLite.
+
+Manual runs accept optional `debug_article_id`; the workflow prints that article's cached candidate snapshots before scanning. Use it to investigate missing items from real stored metrics.
 
 `actions/cache` is not transactional state. Closely spaced or retried runs may restore an older database, so the current system cannot promise exactly-once notifications.
 

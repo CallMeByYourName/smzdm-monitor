@@ -25,16 +25,16 @@ DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 
 CONFIG = {
     # 扫描参数
-    "max_pages": 40,                    # 100 条/页，仍保持每轮最多 4000 条
+    "max_pages": 51,                    # 接口当前最多提供 5100 条；高峰期 4000 条仅覆盖约 1.5 小时
     "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 100,              # 实测接口上限为 100，减少实时分页漂移和请求次数
     "max_consecutive_page_failures": 3, # 主列表连续失败时结束本轮，交给下一次定时任务重试
     "rank_source_enabled": True,       # 总榜补充会重新浮出超过 6 小时但近期升温的商品
     "rank_source_url": "https://m.smzdm.com/sou/category_rank",
-    "rank_source_hours": [3, 12],      # 每半小时轮换，仍保持每轮只请求一个榜单
-    "rank_source_slot_seconds": 1800,
-    "rank_source_limit": 20,           # 每轮只请求一次总榜，避免增加反爬压力
+    "rank_source_hours": [1, 3, 12],   # 配合 15 分钟触发轮换短期、升温和成熟榜单
+    "rank_source_slot_seconds": 900,
+    "rank_source_limit": 50,           # 接口单次最多返回 50 条，仍只请求一次总榜
 
     # 第一阶段：综合评分筛选
     "score_weights": {
@@ -67,6 +67,9 @@ CONFIG = {
     "early_signal_min_total_engagement": 16,
     "early_signal_min_composite_score": 28,
     "early_signal_min_score_rate": 95,
+    "single_unworthy_tolerance_min_worthy": 6,  # 小样本只出现 1 个不值时，不让 95% 门槛一票否决
+    "single_unworthy_tolerance_max_unworthy": 1,
+    "single_unworthy_tolerance_min_score_rate": 85,
     "super_deal_min_comments": 20,       # 超级好价：高值率、高评论、高收藏和值票
     "super_deal_min_worthy": 20,
     "super_deal_min_collection": 10,
@@ -219,7 +222,7 @@ CONFIG = {
         r"(?:旗舰店|专营店|专卖店|店铺).{0,12}\d+\s*元?\s*(?:红包|优惠券)\s*$",
         r"(?:官旗|旗舰店).{0,12}加\s*g[o0]\s*l[o0]\s*$",
         # 实际日志中的中文数字、专区、经营部和反向奖励语序变体。
-        r"加购.{0,8}(?:\d[\d\s]*|[零一二两三四五六七八九十百千万]+)\s*个?\s*(?:京豆|豆(?![\u4e00-\u9fff]))\s*$",
+        r"加购.{0,24}(?:\d[\d\s]*|[零一二两三四五六七八九十百千万]+)\s*[）)]?\s*个?\s*(?:京豆|豆(?![\u4e00-\u9fff]))\s*$",
         r"(?:旗舰店|专营店|专卖店|店铺|专区|经营部|京东自营).{0,20}(?:有|共计|一共|共|等级礼包).{0,12}(?:\d[\d\s]*|[零一二两三四五六七八九十百千万]+)\s*(?:京豆|个?豆(?![\u4e00-\u9fff]))\s*$",
         r"(?:\d[\d\s]*|[零一二两三四五六七八九十百千万]+)\s*元?\s*e卡.{0,8}抽奖\s*$",
         r"进入.{0,8}弹窗.{0,20}(?:领|领取)",
@@ -1377,6 +1380,16 @@ class SmzdmScraper:
             return trend.get('growth_score', 0)
         return 0
 
+    @staticmethod
+    def _meets_score_rate_requirement(worthy, unworthy, score_rate, required_rate):
+        if score_rate >= required_rate:
+            return True
+        return (
+            worthy >= CONFIG['single_unworthy_tolerance_min_worthy']
+            and unworthy <= CONFIG['single_unworthy_tolerance_max_unworthy']
+            and score_rate >= CONFIG['single_unworthy_tolerance_min_score_rate']
+        )
+
     def _filter_stage1(self, parsed):
         """第一阶段：综合评分筛选"""
         comments = parsed['comments']
@@ -1422,27 +1435,35 @@ class SmzdmScraper:
                 and collection >= CONFIG['min_balanced_collection']
                 and total_engagement >= CONFIG['min_total_engagement']
                 and composite_score >= CONFIG['min_composite_score']
-                and score_rate >= CONFIG['min_score_rate']):
+                and self._meets_score_rate_requirement(
+                    worthy, unworthy, score_rate, CONFIG['min_score_rate']
+                )):
             quality_path = '均衡热度'
         elif (worthy >= CONFIG['emerging_min_worthy']
               and comments >= CONFIG['emerging_min_comments']
               and collection >= CONFIG['emerging_min_collection']
               and total_engagement >= CONFIG['emerging_min_total_engagement']
               and composite_score >= CONFIG['emerging_min_composite_score']
-              and score_rate >= CONFIG['emerging_min_score_rate']):
+              and self._meets_score_rate_requirement(
+                  worthy, unworthy, score_rate, CONFIG['emerging_min_score_rate']
+              )):
             quality_path = '早期好价'
         elif (worthy >= CONFIG['early_signal_min_worthy']
               and collection >= CONFIG['early_signal_min_collection']
               and total_engagement >= CONFIG['early_signal_min_total_engagement']
               and composite_score >= CONFIG['early_signal_min_composite_score']
-              and score_rate >= CONFIG['early_signal_min_score_rate']):
+              and self._meets_score_rate_requirement(
+                  worthy, unworthy, score_rate, CONFIG['early_signal_min_score_rate']
+              )):
             quality_path = '早期强信号'
         elif (trend.get('snapshot_count', 0) > 0
               and worthy >= CONFIG['warming_min_worthy']
               and collection >= CONFIG['warming_min_collection']
               and total_engagement >= CONFIG['warming_min_total_engagement']
               and composite_score >= CONFIG['warming_min_composite_score']
-              and score_rate >= CONFIG['warming_min_score_rate']
+              and self._meets_score_rate_requirement(
+                  worthy, unworthy, score_rate, CONFIG['warming_min_score_rate']
+              )
               and self._has_warming_trend(trend)):
             quality_path = '升温好价'
 
