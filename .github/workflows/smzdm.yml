@@ -3,6 +3,11 @@ name: SMZDM 好价监控 NEW
 on:
   # 由 cron-job.org 每 15 分钟触发。不要再叠加 GitHub schedule，避免重复扫描。
   workflow_dispatch:
+    inputs:
+      debug_article_id:
+        description: '可选：查询指定文章 ID 的候选快照'
+        required: false
+        type: string
   repository_dispatch:
     types: [cron_trigger]
 
@@ -34,6 +39,24 @@ jobs:
           key: smzdm-db-${{ github.run_id }}
           restore-keys: |
             smzdm-db-
+
+      - name: Diagnose requested article
+        if: ${{ inputs.debug_article_id != '' }}
+        env:
+          DEBUG_ARTICLE_ID: ${{ inputs.debug_article_id }}
+        run: |
+          if [[ ! "$DEBUG_ARTICLE_ID" =~ ^[0-9]+$ ]]; then
+            echo "debug_article_id must contain digits only"
+            exit 1
+          fi
+          echo "Candidate snapshots for article $DEBUG_ARTICLE_ID:"
+          sqlite3 -header -column smzdm.db "
+            SELECT article_id, snapshot_key, title, worthy, collection,
+                   comments, unworthy, captured_at
+            FROM candidate_snapshots
+            WHERE article_id = '$DEBUG_ARTICLE_ID'
+            ORDER BY captured_at;
+          "
 
       - name: Run scraper
         env:
