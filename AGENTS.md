@@ -46,7 +46,7 @@ The only runtime dependency is `requests`.
 - Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=50&hour=N`.
 - Ranking windows rotate through 1, 3, and 12 hours in 15-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
 - Bounded late rechecks use `https://haojia-api.smzdm.com/detail/{article_id}` to refresh active status, price, mall, direct product link, and current interaction counts after a candidate has left both discovery feeds.
-- Late rechecks select unsent snapshots no older than 18 hours when they previously had worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8. They exclude IDs found by the current main/rank scan, use a backlog-scaled budget of 4–16 requests, wait at least 45 minutes per article, and prioritize never-checked rows nearest the age deadline before repeat checks.
+- Late rechecks select unsent snapshots no older than 18 hours when they previously had worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8. They exclude IDs found by the current main/rank scan, use a backlog-scaled budget of 4–16 requests, wait at least 45 minutes per article, and prioritize never-checked rows nearest the age deadline before repeat checks. The selector overfetches local SQLite rows, retires blocked task titles, and backfills the request budget with valid products without increasing external traffic.
 - `faxian/list` and `youhui/list` channel endpoints opportunistically enrich `article_link`, `mall_no`, and `product_no`.
 - `tongji_hudong` is preferred for comments, collection, worthy, and unworthy counts, with top-level fields as fallback.
 
@@ -71,7 +71,7 @@ Balanced, early, and warming paths have one controlled score-rate exception: at 
 
 All paths require at least two worthy votes or two comments. Sold-out, timed-out, expired, and ended items are rejected.
 
-There is no broad category or keyword blacklist. The title filter is intentionally narrow and blocks non-product reward/task posts such as variable `入会...京豆` forms, shop follow/add-to-cart/sign-in rewards, random-red-packet popups, points-to-Jingdou activities, non-guaranteed lucky bags, and ambiguous campaign pages. It normalizes full-width and decorated digits before matching. When changing these expressions, add both positive and negative regression samples; product false positives are a higher-risk failure than allowing one new activity-title variant through.
+There is no broad category or keyword blacklist. The title filter is intentionally narrow and blocks non-product reward/task posts such as variable `入会...京豆` forms, shop follow/add-to-cart/sign-in rewards, reward-day/E-card sequences, store-only titles, livestream rooms, coupon roundups, random-red-packet popups, points-to-Jingdou activities, non-guaranteed lucky bags, and ambiguous campaign pages. It normalizes full-width and decorated digits before matching and runs before snapshot persistence so task posts cannot seed trend or late-recheck state. When changing these expressions, add both positive and negative regression samples; product false positives are a higher-risk failure than allowing one new activity-title variant through.
 
 ## Trend Logic
 

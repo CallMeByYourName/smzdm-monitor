@@ -82,6 +82,18 @@ class SmzdmFilterTests(unittest.TestCase):
             "京东关注有礼（1）个豆子",
             "值友专享：深夜游乐场，满18续摊～",
             "洋河京东自营旗舰店，会员页下拉找到加购有礼，加购4件商品（20）京豆",
+            "京东直播 欧乐B口腔护理直播间",
+            "京东 手机馆京豆",
+            "出发10豆，领到点值",
+            "8月等级礼包15豆",
+            "京东 爱肯拿京东自营 15天抢1000豆",
+            "伊利牛奶旗舰店 入会抽奖",
+            "Friso 美素佳儿健康海外京东有十豆",
+            "雀巢beba 7天50豆 需入会",
+            "京东 雅培科学营养海外自营店 7天5元E卡，15天20E卡",
+            "养生堂京东自营旗舰店",
+            "心相印 8月 积分换豆",
+            "今日好券|7.31上新：周五好券速领！京东X建行领4元支付券",
         ]
         for title in blocked_titles:
             with self.subTest(title=title):
@@ -124,6 +136,10 @@ class SmzdmFilterTests(unittest.TestCase):
             "vivo X300 手机 赠品牌福袋",
             "沱牌 旗舰店签名纪念酒 500ml",
             "屈臣氏 苏打水 加购价19.9元",
+            "京东直播价：欧乐B iO3 电动牙刷",
+            "养生堂京东自营旗舰店 维生素C咀嚼片 90片",
+            "心相印 茶语丝享抽纸 3层100抽*24包",
+            "华为 Mate 80 旗舰店同款手机",
         ]
         for title in titles:
             with self.subTest(title=title):
@@ -360,6 +376,69 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertEqual(Session.calls[0][1]["params"]["hour"], 3)
         self.assertEqual(Session.calls[0][1]["params"]["limit"], 50)
         self.assertEqual(rows[0]["_rank_window_hours"], 3)
+
+    def test_blocked_title_does_not_create_trend_snapshot(self):
+        parsed = {
+            "id": "179635526",
+            "title": "伊利牛奶旗舰店 入会抽奖",
+            "mall": "京东",
+        }
+        self.scraper.stats = {
+            "total_duplicates": 0,
+            "total_filtered_title_pattern": 0,
+            "total_rank_filtered_title": 0,
+        }
+        self.scraper._is_duplicate = lambda item: False
+        self.scraper._attach_trend_metrics = lambda item: self.fail(
+            "blocked titles must not enter trend tracking"
+        )
+        self.scraper._save_candidate_snapshot = lambda item: self.fail(
+            "blocked titles must not create late-recheck snapshots"
+        )
+
+        candidates = []
+        self.scraper._consider_stage1_candidate(parsed, candidates)
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(self.scraper.stats["total_filtered_title_pattern"], 1)
+
+    def test_late_recheck_backfills_budget_after_blocked_titles(self):
+        rows = [
+            {"article_id": "1", "title": "伊利牛奶旗舰店 入会抽奖"},
+            {"article_id": "2", "title": "京东 手机馆京豆"},
+            {"article_id": "3", "title": "正常商品 A"},
+            {"article_id": "4", "title": "正常商品 B"},
+        ]
+        select_limits = []
+        marked = []
+        requested = []
+
+        def select_rows(discovered, limit):
+            select_limits.append(limit)
+            return rows
+
+        self.scraper.external_checks_suspended = False
+        self.scraper.late_recheck_eligible_count = 50
+        self.scraper.stats = {
+            "total_late_recheck_eligible": 0,
+            "total_late_recheck_selected": 0,
+            "total_filtered_title_pattern": 0,
+        }
+        self.scraper._select_late_recheck_rows = select_rows
+        self.scraper._calculate_late_recheck_limit = lambda eligible: 2
+        self.scraper._mark_late_recheck = (
+            lambda article_id, retired=False: marked.append((article_id, retired))
+        )
+        self.scraper._fetch_late_recheck_detail = (
+            lambda article_id: requested.append(article_id)
+        )
+
+        self.scraper._append_late_recheck_candidates(set(), [])
+
+        self.assertEqual(select_limits, [CONFIG["max_late_rechecks_per_run"] * 3])
+        self.assertEqual(marked[:2], [("1", True), ("2", True)])
+        self.assertEqual(requested, ["3", "4"])
+        self.assertEqual(self.scraper.stats["total_late_recheck_selected"], 2)
 
     def test_main_scan_stops_after_consecutive_page_failures(self):
         calls = []

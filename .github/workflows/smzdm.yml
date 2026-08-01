@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -33,7 +33,7 @@ jobs:
       # 从缓存恢复 SQLite 数据库
       - name: Restore database cache
         id: cache-db
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: smzdm.db
           key: smzdm-db-${{ github.run_id }}
@@ -123,7 +123,7 @@ jobs:
       # 保存 SQLite 数据库到缓存 (无论成功失败都保存，以便保留进度)
       - name: Save database cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: smzdm.db
           key: smzdm-db-${{ github.run_id }}

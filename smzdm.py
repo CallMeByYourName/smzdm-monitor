@@ -255,6 +255,17 @@ CONFIG = {
         r"福袋.{0,30}(?:活动|抽奖).{0,20}(?:非必中|概率)",
         r"关注有礼.{0,12}(?:\d[\d\s]*|[零一二两三四五六七八九十百千万]+)\s*[）)]?\s*个?\s*豆子?",
         r"深夜游乐场",
+        # 2026-08-01 Actions 实际漏网：标题只有店铺任务、奖励或直播会场。
+        r"(?:旗舰店|自营店|京东自营).{0,20}入会.{0,8}抽奖\s*$",
+        r"(?:^|[\s，,、:：|])(?:\d+月)?等级礼包.{0,12}(?:\d+|[零一二两三四五六七八九十百千万]+)\s*豆\s*$",
+        r"\d+\s*天.{0,20}(?:抢|领|得)?\s*(?:\d+|[零一二两三四五六七八九十百千万]+)\s*(?:京豆|豆|元?\s*[eE]卡)",
+        r"积分.{0,12}(?:兑换|兑|换).{0,8}(?:京豆|豆)\s*$",
+        r"(?:手机馆|会员页|圈子).{0,12}京豆\s*$",
+        r"(?:^|京东\s+)出发.{0,8}(?:\d+|[零一二两三四五六七八九十百千万]+)\s*豆",
+        r"京东直播.{0,30}直播间\s*$",
+        r"(?:今日好券|好券速领|领\d+元支付券|整点抢\d+元.{0,8}券)",
+        r"京东.{0,24}(?:有|送|领)(?:\d+|[零一二两三四五六七八九十百千万]+)\s*豆\s*$",
+        r"^.{1,30}(?:官方)?(?:京东自营)?旗舰店\s*$",
     ],
 
     # 去重参数
@@ -714,14 +725,14 @@ class SmzdmScraper:
                 )
             return
 
-        self._attach_trend_metrics(parsed)
-        self._save_candidate_snapshot(parsed)
-
         if self._is_title_blocked(parsed):
             self.stats['total_filtered_title_pattern'] += 1
             if parsed.get('rank_source'):
                 self.stats['total_rank_filtered_title'] += 1
             return
+
+        self._attach_trend_metrics(parsed)
+        self._save_candidate_snapshot(parsed)
 
         if not self._filter_stage1(parsed):
             self.stats['total_filtered_stage1'] += 1
@@ -813,10 +824,25 @@ class SmzdmScraper:
         if max_limit <= 0:
             return
 
-        rows = self._select_late_recheck_rows(discovered_ids, max_limit)
+        # 多取一批纯数据库候选，先剔除任务标题，再用有效商品补足网络预算。
+        rows = self._select_late_recheck_rows(discovered_ids, max_limit * 3)
         eligible_count = self.late_recheck_eligible_count
         limit = self._calculate_late_recheck_limit(eligible_count)
-        rows = rows[:limit]
+        selected_rows = []
+        for row in rows:
+            article_id = str(row.get('article_id') or '').strip()
+            if self._is_title_blocked({
+                'title': str(row.get('title') or ''),
+                'mall': '',
+            }):
+                self.stats['total_filtered_title_pattern'] += 1
+                self._mark_late_recheck(article_id, retired=True)
+                logging.info(f"[延迟复查退出] article_id:{article_id} 标题已过滤")
+                continue
+            selected_rows.append(row)
+            if len(selected_rows) >= limit:
+                break
+        rows = selected_rows
         self.stats['total_late_recheck_eligible'] = eligible_count
         self.stats['total_late_recheck_selected'] += len(rows)
         logging.info(
@@ -827,14 +853,6 @@ class SmzdmScraper:
             if self.external_checks_suspended:
                 break
             article_id = str(row.get('article_id') or '').strip()
-            if self._is_title_blocked({
-                'title': str(row.get('title') or ''),
-                'mall': '',
-            }):
-                self.stats['total_filtered_title_pattern'] += 1
-                self._mark_late_recheck(article_id, retired=True)
-                logging.info(f"[延迟复查退出] article_id:{article_id} 标题已过滤")
-                continue
             logging.info(
                 f"[延迟复查请求] id:{article_id} "
                 f"旧评分:{row.get('composite_score', 0)} "

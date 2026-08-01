@@ -46,7 +46,7 @@ Balanced, early, and warming paths tolerate one unworthy vote only when worthy >
 
 All paths require at least two worthy votes or two comments. Inactive items are rejected.
 
-The script has no broad category blacklist. Its narrow normalized-regex filter targets non-product tasks and reward pages, including variable `入会...京豆`, follow/add-to-cart/sign-in rewards, points conversion, popup red packets, ambiguous campaign pages, and the concrete variants found in Actions logs. Add paired blocked and allowed regression tests whenever changing title expressions.
+The script has no broad category blacklist. Its narrow normalized-regex filter targets non-product tasks and reward pages, including variable `入会...京豆`, follow/add-to-cart/sign-in rewards, reward-day/E-card sequences, store-only titles, livestream rooms, coupon roundups, points conversion, popup red packets, ambiguous campaign pages, and the concrete variants found in Actions logs. Title filtering runs before snapshot persistence; late rechecks also retire blocked legacy rows and backfill the bounded request budget. Add paired blocked and allowed regression tests whenever changing title expressions.
 
 ## Trends
 
