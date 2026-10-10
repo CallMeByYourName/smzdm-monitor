@@ -1,12 +1,14 @@
 # AGENTS.md
 
-This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-07-27`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
+This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-10`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
 ## Project Overview
 
 This repository contains a single-run SMZDM (什么值得买) deal monitor. It scans deal feeds, evaluates engagement quality and growth, performs limited comment-sample checks, deduplicates accepted products in SQLite, and sends WXPusher HTML notifications.
 
 The main design constraint is asymmetric data quality: list engagement fields are broadly available, while full comment-level distributions and JD store/self-operated fields are not reliably available from GitHub Actions. Do not turn unavailable external data into a hard rejection unless the user explicitly changes that policy.
+
+The user wants broad discovery with a more informative notification list. Do not add a global category blacklist or infer personal interests from the existing pushed items. Engagement shows community attention, not verified price advantage, superior product quality, or a personal purchase recommendation. Do not infer a quality certification from brand names or a low price. Notification formatting reuses existing data without new external requests.
 
 ## Commands
 
@@ -33,6 +35,7 @@ The script performs one scan, sends any accepted deals, and exits. Scheduling be
 
 - `smzdm.py`: application code, configuration, SQLite schema, filtering, network access, and notification formatting.
 - `test_smzdm.py`: unit tests for feed handling, title filters, quality paths, trends, comments, deduplication, and push logs.
+- `test_trends_titles.py`, `test_notification_format.py`, `test_push_delivery.py`: focused tests for article isolation/title protection, notification display, and recipient delivery-result handling.
 - `.github/workflows/smzdm.yml`: GitHub Actions runner and SQLite cache handling.
 - `README.md`: current user-facing behavior and deployment documentation.
 - `analysis/`: dated historical log reviews. A dated report is evidence from that point in time, not current configuration.
@@ -73,9 +76,13 @@ All paths require at least two worthy votes or two comments. Sold-out, timed-out
 
 There is no broad category or keyword blacklist. The title filter is intentionally narrow and blocks non-product reward/task posts such as variable `入会...京豆` forms, shop follow/add-to-cart/sign-in rewards, reward-day/E-card sequences, store-only titles, livestream rooms, coupon roundups, random-red-packet popups, points-to-Jingdou activities, non-guaranteed lucky bags, and ambiguous campaign pages. It normalizes full-width and decorated digits before matching and runs before snapshot persistence so task posts cannot seed trend or late-recheck state. When changing these expressions, add both positive and negative regression samples; product false positives are a higher-risk failure than allowing one new activity-title variant through.
 
+The store-only rule must preserve titles with concrete product categories, models, or specifications even when they end in `官方旗舰店`. Pair actual product titles from Actions logs with blocked store-entry titles; a flagship-store suffix alone is not sufficient evidence of a task page.
+
 ## Trend Logic
 
 `candidate_snapshots` retains two days of candidate interaction history. Growth weights are worthy 3, collection 2, comments 4, and unworthy -2.
+
+Trend queries and run-local snapshot deduplication are isolated by article ID. Two articles for the same SKU/fingerprint have independent engagement counts and must never supply growth to each other. Legacy snapshots keyed by SKU/fingerprint remain readable only for the same article ID. Product push deduplication continues to use SKU/fingerprint; do not couple its key to the trend identity.
 
 - Low-confidence `早期好价` and `早期强信号` candidates normally wait for another observation with meaningful growth and at least one new worthy vote.
 - Already mature balanced candidates or highly discussed candidates can bypass this wait using the explicit thresholds in `CONFIG`.
@@ -116,21 +123,37 @@ Old JD lookup helpers remain behind the disabled flag. Do not enable hard reject
 
 ## Deduplication
 
-- Only successful pushes enter `history`.
+- Only sends accepted for the target UID enter `history`: validate outer WXPusher `success`/`code` and that UID's `code=1000`, then retain `send_record_id`. An accepted asynchronous send task does not prove terminal delivery or user reading.
 - Article IDs, platform product keys, and normalized title fingerprints are checked.
 - Fingerprints remain active for 30 days. Price text is normalized before fingerprinting.
 - The same SKU or fingerprint may be pushed again when the parsed price is at least RMB 5 lower or at least 5% lower than the historical minimum.
-- Successful push logs include article ID, quality path, parsed price, score rate, and engagement counts so Actions runs can be audited precisely.
+- Successful push logs include article ID, source, quality path, parsed price, score rate, engagement counts, target status, and send record ID so Actions runs can be audited precisely.
+
+## Notification Contract
+
+- Set a separate WXPusher `summary` (at most 100 characters) with price and explicit purchase conditions before the short product name, followed by a concise evidence-based reason. Strip only leading marketing prefixes. Recognize conditions from title/price, including `88VIP`, `PLUS会员`, required quantities, national subsidies, Tao coins, coupons, regional restrictions, add-on items, mobile-only terms, random-free-order campaigns, and review rewards. Link details to the original article for complete terms.
+- Label E-card/points rebates as `含返E卡`/`含返积分`; add `折算` only when the original price explicitly describes an amount after rebate. `119.9元（返240积分）` does not establish that points were deducted from the price. Preserve starting-price, range, unit-price, and complex-rebate semantics; retain original price text and ask readers to check payment and rebate separately.
+- Lead HTML details with price, product, purchase conditions, and verifiable facts: actual same-article worthy/collection growth, the fetched ranking window/position, or a drop from this project's historical pushed price. Fall back to current worthy/comment counts if none is available. Do not call the historical comparison a market/all-time low.
+- Without a historical price-drop note, state `价差未核实` in the summary and that price advantage needs checking in details. Even with a prior-push comparison, purchase conditions may differ. Ranking or passing an internal quality path does not independently establish a good purchase price or product quality.
+- Display `score_rate` as `值票支持率`, computed from worthy/(worthy+unworthy). It is not the buyer product-review approval rate; include underlying vote counts.
+- Keep a concise diagnostic section after the purchase link: composite score, quality path, article observation window/growth score, comment coverage, and unavailable-level notes. Full comment-level/concentration statistics and trend-baseline details belong in audit logs.
+- Escape all external text included in HTML. Keep list summaries readable without requiring the user to open an algorithm report.
+
+Price comparison excludes rebates, coupon thresholds/face values, gifts, and original prices. Startup recalculates stored history price values to correct legacy rebate amounts mistaken for sale prices.
 
 ## Network Stability
 
 - GET requests use retry total 2, exponential backoff, and retries for HTTP 500/502/503/504.
+- Disable automatic `Retry-After` waits (`respect_retry_after_header=False`); HTTP 429 must reach the existing circuit-breaker handling promptly instead of sleeping outside the bounded run window.
 - Connect/read timeouts are 8/20 seconds.
 - Main-feed scanning stops after three consecutive failed pages and leaves recovery to the next scheduled run.
 - External detail/comment calls use randomized throttling.
 - HTTP 202/403/429, captcha markers, `probe.js`, or access-frequency responses suspend external checks for the rest of the run.
 - Two consecutive comment or late-detail request failures also open the run-local circuit breaker.
 - Late-detail traffic scales at 4% of the eligible backlog with a 4-request floor and 16-request hard cap. It is tracked independently in `late_recheck_state`; failure is diagnostic and does not stop main-feed discovery.
+- WXPusher POST is not retried immediately. A timeout is an unknown outcome, is counted separately in send diagnostics, and must not be reported as a confirmed rejection or terminal success. Failed or unknown sends do not enter `history`; a future scan may reevaluate them, so duplicate delivery remains possible.
+
+Filter, comment, trend, and send diagnostics should include article ID and source. Log comment coverage and trend baseline article/time, and include send-failure totals in the run summary. Avoid logging app tokens or full recipient identifiers.
 
 Keep the external request count bounded. New sources should first reuse existing JSON endpoints, have strict timeouts, and degrade without blocking the full scan.
 
@@ -138,16 +161,18 @@ Keep the external request count bounded. New sources should first reuse existing
 
 `.github/workflows/smzdm.yml` accepts `workflow_dispatch` and `repository_dispatch` with event type `cron_trigger`. cron-job.org currently sends the external trigger every 15 minutes. There is deliberately no GitHub `schedule`, which avoids double triggering.
 
+The 2026-10-10 review supports keeping this cadence: recent runs averaged about four minutes, 72/100 reached the 5100-row cap, and early paths need timely repeat observations. Do not add immediate recovery dispatches for hosted-runner startup failures; the next scheduled run recovers without extra duplicate traffic. Revisit cadence with new latency, coverage, or rate-limit evidence.
+
 Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID and prints matching `candidate_snapshots` plus successful-push history for the same ID, SKU, or fingerprint before the scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
 
-The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
+The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, unit tests before scanning, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
 
 ## Change Checklist
 
 For filtering or parsing changes:
 
 1. Confirm behavior against real API or Actions payloads; do not invent response fields.
-2. Add focused positive and negative tests, especially for title regex and dedup fingerprints.
+2. Add focused positive and negative tests, especially for title regex, cross-article trend isolation, target-UID send results, notification summaries, and dedup fingerprints.
 3. Run `python3 -m unittest -v` and `git diff --check`.
 4. Keep README, AGENTS, and CLAUDE descriptions synchronized when behavior changes.
 5. After deployment, review Actions summary counters and concrete successful-push log lines before tuning thresholds again.

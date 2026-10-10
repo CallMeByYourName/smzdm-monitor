@@ -265,7 +265,8 @@ CONFIG = {
         r"京东直播.{0,30}直播间\s*$",
         r"(?:今日好券|好券速领|领\d+元支付券|整点抢\d+元.{0,8}券)",
         r"京东.{0,24}(?:有|送|领)(?:\d+|[零一二两三四五六七八九十百千万]+)\s*豆\s*$",
-        r"^.{1,30}(?:官方)?(?:京东自营)?旗舰店\s*$",
+        # 仅拦已确认只有店铺名称的标题；旗舰店后缀不能证明前面没有商品。
+        r"^(?:(?:京东|天猫(?:超市)?|淘宝)\s+){0,2}(?:养生堂|元气森林|周六福)(?:官方)?(?:京东自营)?旗舰店\s*$",
     ],
 
     # 去重参数
@@ -330,6 +331,8 @@ class SmzdmScraper:
             'total_late_recheck_unavailable': 0,
             'total_late_recheck_filtered_stage1': 0,
             'total_sent': 0,
+            'total_push_failed': 0,
+            'total_push_unknown': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
             'total_product_key_duplicates': 0,
@@ -391,7 +394,8 @@ class SmzdmScraper:
             status_forcelist=[500, 502, 503, 504],
             allowed_methods=frozenset({'GET'}),
             raise_on_status=False,
-            respect_retry_after_header=True,
+            # 429 必须立即交给本轮熔断，避免 Retry-After 将单次任务挂起数小时。
+            respect_retry_after_header=False,
         )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=20)
         self.session.mount('https://', adapter)
@@ -415,6 +419,7 @@ class SmzdmScraper:
                 mall TEXT,
                 price TEXT,
                 price_value REAL,
+                send_record_id TEXT,
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -483,6 +488,7 @@ class SmzdmScraper:
             'mall': 'TEXT',
             'price': 'TEXT',
             'price_value': 'REAL',
+            'send_record_id': 'TEXT',
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
@@ -491,12 +497,13 @@ class SmzdmScraper:
 
     def _backfill_history_price_values(self):
         cursor = self.conn.execute(
-            "SELECT id, price FROM history WHERE price_value IS NULL AND price IS NOT NULL AND price != ''"
+            "SELECT id, price, price_value FROM history WHERE price IS NOT NULL AND price != ''"
         )
         rows = cursor.fetchall()
-        for article_id, price in rows:
+        for article_id, price, old_value in rows:
             price_value = self._parse_price_value(price)
-            if price_value is not None:
+            # 同时修复旧版本误把返还/券面额存成售价的记录，而非只补 NULL。
+            if price_value != old_value:
                 self.conn.execute(
                     "UPDATE history SET price_value = ? WHERE id = ?",
                     (price_value, article_id)
@@ -586,7 +593,7 @@ class SmzdmScraper:
                 self.stats['total_filtered_trend_slow'] += 1
                 trend = parsed.get('trend_metrics') or {}
                 logging.warning(
-                    f"[增长过慢过滤] {parsed['title'][:40]}... | "
+                    f"[增长过慢过滤] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} {self._trend_log_context(parsed)} "
                     f"路径:{parsed.get('quality_path')} 已观察:{trend.get('elapsed_minutes', 0)}分钟 "
                     f"累计增长:{trend.get('growth_score', 0)} "
                     f"近期增长:{trend.get('recent_growth_score', 0)} "
@@ -600,7 +607,7 @@ class SmzdmScraper:
                 self.stats['total_deferred_trend_confirmation'] += 1
                 trend = parsed.get('trend_metrics') or {}
                 logging.info(
-                    f"[等待趋势确认] {parsed['title'][:40]}... | "
+                    f"[等待趋势确认] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} {self._trend_log_context(parsed)} "
                     f"路径:{parsed.get('quality_path')} 评分:{parsed.get('composite_score', 0)} "
                     f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                     f"值:{parsed.get('worthy', 0)} 快照:{trend.get('snapshot_count', 0)} "
@@ -614,7 +621,7 @@ class SmzdmScraper:
                 self.stats['total_filtered_trend_low_growth'] += 1
                 trend = parsed.get('trend_metrics') or {}
                 logging.warning(
-                    f"[增长过低过滤] {parsed['title'][:40]}... | "
+                    f"[增长过低过滤] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} {self._trend_log_context(parsed)} "
                     f"路径:{parsed.get('quality_path')} 已观察:{trend.get('elapsed_minutes', 0)}分钟 "
                     f"增长分:{trend.get('growth_score', 0)} "
                     f"近期增长:{trend.get('recent_growth_score', 0)} "
@@ -743,8 +750,8 @@ class SmzdmScraper:
                 metrics = self._current_interaction_metrics(parsed)
                 logging.info(
                     f"[排行榜跳过:评分 #{parsed.get('rank_position')}] "
-                    f"{parsed['title'][:40]}... | "
-                    f"评分:{metrics['composite_score']} 好评率:{metrics['score_rate']}% "
+                    f"{parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
+                    f"评分:{metrics['composite_score']} 值票支持率:{metrics['score_rate']}% "
                     f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                     f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
                 )
@@ -755,14 +762,14 @@ class SmzdmScraper:
         if parsed.get('late_recheck_source'):
             self.stats['total_late_recheck_candidates'] += 1
             logging.info(
-                f"[延迟复查候选] {parsed['title'][:40]}... | "
+                f"[延迟复查候选] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
                 f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                 f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
             )
         if parsed.get('rank_source'):
             self.stats['total_rank_candidates'] += 1
             logging.info(
-                f"[排行榜候选 #{parsed.get('rank_position')}] {parsed['title'][:40]}... | "
+                f"[排行榜候选 #{parsed.get('rank_position')}] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
                 f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                 f"值:{parsed.get('worthy', 0)} 不值:{parsed.get('unworthy', 0)}"
             )
@@ -1370,10 +1377,15 @@ class SmzdmScraper:
         """从价格文本中提取可比较的人民币数值，解析失败返回 None。"""
         text = str(price_text or '')
         text = text.replace(',', '')
-        matches = re.findall(r'(\d+(?:\.\d+)?)\s*元', text)
-        if not matches:
+        values = []
+        for match in re.finditer(r'(\d+(?:\.\d+)?)\s*元', text):
+            prefix = text[max(0, match.start() - 16):match.start()]
+            # 返还额、满减门槛、赠品面值和原价不是当前售价。
+            if re.search(r'(?:返(?:还)?|退(?:还)?|赠|送|赔|满|减|立减|省|原价|价值|面值|券面额)\s*$', prefix):
+                continue
+            values.append(float(match.group(1)))
+        if not values:
             return None
-        values = [float(value) for value in matches]
         if any(keyword in text for keyword in ('低至', '折合', '约', '券后', '到手')):
             return min(values)
         return values[-1]
@@ -1382,22 +1394,27 @@ class SmzdmScraper:
 
     def _attach_trend_metrics(self, parsed):
         key = self._candidate_snapshot_key(parsed)
+        article_id = str(parsed.get('id') or '').strip()
+        empty_metrics = self._empty_trend_metrics()
+        empty_metrics.update({'item_key': key, 'article_id': article_id})
         if not key:
-            parsed['trend_metrics'] = self._empty_trend_metrics()
+            parsed['trend_metrics'] = empty_metrics
             return
 
         cursor = self.conn.execute(
             '''
             SELECT captured_at, comments, collection, worthy, unworthy
             FROM candidate_snapshots
-            WHERE item_key = ?
+            WHERE article_id = ?
             ORDER BY captured_at ASC
             ''',
-            (key,)
+            # 旧数据库的 key 可能是 fp/sku；按文章取数既保留同文章旧历史，
+            # 又不把另一篇爆料独立的互动计数当作本篇的增长。
+            (article_id,)
         )
         rows = cursor.fetchall()
         if not rows:
-            parsed['trend_metrics'] = self._empty_trend_metrics()
+            parsed['trend_metrics'] = empty_metrics
             return
 
         first = rows[0]
@@ -1418,6 +1435,9 @@ class SmzdmScraper:
         parsed['trend_metrics'] = {
             'snapshot_count': len(rows),
             'item_key': key,
+            'article_id': article_id,
+            'first_captured_at': first[0],
+            'previous_captured_at': previous[0],
             'elapsed_minutes': round(elapsed_minutes),
             'recent_minutes': round(recent_minutes),
             'delta_comments': first_delta['comments'],
@@ -1441,6 +1461,10 @@ class SmzdmScraper:
     def _empty_trend_metrics():
         return {
             'snapshot_count': 0,
+            'item_key': '',
+            'article_id': '',
+            'first_captured_at': '',
+            'previous_captured_at': '',
             'elapsed_minutes': 0,
             'recent_minutes': 0,
             'delta_comments': 0,
@@ -1528,7 +1552,7 @@ class SmzdmScraper:
             ''',
             (
                 item_key,
-                parsed.get('id'),
+                str(parsed.get('id') or '').strip(),
                 parsed.get('title', '')[:100],
                 parsed.get('fingerprint', ''),
                 parsed.get('product_key') or self._build_product_key(parsed),
@@ -1565,13 +1589,8 @@ class SmzdmScraper:
         )
 
     def _candidate_snapshot_key(self, parsed):
-        product_key = parsed.get('product_key') or self._build_product_key(parsed)
-        if product_key:
-            return f"sku:{product_key}"
-        fingerprint = parsed.get('fingerprint')
-        if fingerprint:
-            return f"fp:{fingerprint}"
-        article_id = parsed.get('id')
+        # 互动计数属于文章；SKU/标题指纹仅用于商品推送去重。
+        article_id = str(parsed.get('id') or '').strip()
         return f"id:{article_id}" if article_id else ''
 
     @staticmethod
@@ -1594,6 +1613,24 @@ class SmzdmScraper:
 
     # ==================== 筛选 ====================
 
+    @staticmethod
+    def _candidate_log_context(parsed):
+        article_id = str(parsed.get('id') or parsed.get('article_id') or '-').strip()
+        source = '延迟详情' if parsed.get('late_recheck_source') else '主列表'
+        if parsed.get('rank_source'):
+            rank = f"{parsed.get('rank_window_hours') or 12}小时榜#{parsed.get('rank_position') or '-'}"
+            source = rank if not parsed.get('late_recheck_source') else f'{source}+{rank}'
+        return f'id:{article_id} 来源:{source}'
+
+    @staticmethod
+    def _trend_log_context(parsed):
+        trend = parsed.get('trend_metrics') or {}
+        return (
+            f"趋势文章:{trend.get('article_id') or parsed.get('id') or '-'} "
+            f"首快照:{trend.get('first_captured_at') or '-'} "
+            f"前快照:{trend.get('previous_captured_at') or '-'}"
+        )
+
     def _is_title_blocked(self, parsed):
         text = self._normalize_task_title(
             f"{parsed.get('mall', '')} {parsed.get('title', '')}"
@@ -1602,7 +1639,7 @@ class SmzdmScraper:
             if re.search(pattern, text, flags=re.IGNORECASE):
                 parsed['blocked_title_pattern'] = pattern
                 logging.warning(
-                    f"[标题正则过滤] {parsed['title'][:40]}... | "
+                    f"[标题正则过滤] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
                     f"pattern:{pattern}"
                 )
                 return True
@@ -1856,14 +1893,14 @@ class SmzdmScraper:
         self.quality_path_pass_counts[quality_path] = self.quality_path_pass_counts.get(quality_path, 0) + 1
 
         logging.info(
-            f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | "
-            f"评分:{composite_score} 有效增长:{effective_trend_score} "
+            f"[综合评分通过:{quality_path}] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
+            f"{self._trend_log_context(parsed)} 评分:{composite_score} 有效增长:{effective_trend_score} "
             f"累计:{growth_score} 近期:{recent_growth_score} "
             f"值增长:{trend.get('delta_worthy', 0)}/"
             f"{trend.get('recent_delta_worthy', 0)} "
             f"收藏增长:{trend.get('delta_collection', 0)}/"
             f"{trend.get('recent_delta_collection', 0)} "
-            f"速率:{trend.get('growth_per_hour', 0)}/h 好评率:{parsed['score_rate']}% "
+            f"速率:{trend.get('growth_per_hour', 0)}/h 值票支持率:{parsed['score_rate']}% "
             f"评论:{comments} 收藏:{collection} 值:{worthy} 不值:{unworthy}"
         )
         return True
@@ -2438,9 +2475,10 @@ class SmzdmScraper:
 
     def _check_comment_user_levels(self, parsed):
         """根据评论 JSON 中的 vip_level 识别低等级账号占比。"""
+        audit = self._candidate_log_context(parsed)
         if self.external_checks_suspended:
             self._mark_comment_level_unavailable(parsed, 'external')
-            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 外部校验已熔断")
+            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | {audit} 外部校验已熔断")
             return True
 
         if parsed.get('comments', 0) < CONFIG['comment_level_min_comments']:
@@ -2452,22 +2490,22 @@ class SmzdmScraper:
                 parsed.pop('comment_level_stats', None)
                 parsed.pop('comment_level_unavailable_reason', None)
                 logging.info(
-                    f"[早期强信号评论跳过] {parsed['title'][:40]}... | "
+                    f"[早期强信号评论跳过] {parsed['title'][:40]}... | {audit} "
                     f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
                     f"值:{parsed.get('worthy', 0)} 评分:{parsed.get('composite_score', 0)} "
-                    f"好评率:{parsed.get('score_rate', 0)}%"
+                    f"值票支持率:{parsed.get('score_rate', 0)}%"
                 )
                 return True
             self._mark_comment_level_unavailable(parsed, 'low_comments')
             logging.info(
-                f"[评论等级跳过] {parsed['title'][:40]}... | "
+                f"[评论等级跳过] {parsed['title'][:40]}... | {audit} "
                 f"列表评论数 {parsed.get('comments', 0)} 不足 {CONFIG['comment_level_min_comments']}"
             )
             return True
 
         if self.comment_level_checks >= self.comment_level_check_limit:
             self._mark_comment_level_unavailable(parsed, 'budget')
-            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | 达到本轮评论等级校验上限")
+            logging.info(f"[评论等级跳过] {parsed['title'][:40]}... | {audit} 达到本轮评论等级校验上限")
             return True
         self.comment_level_checks += 1
 
@@ -2477,6 +2515,12 @@ class SmzdmScraper:
         coverage = self._build_comment_module_coverage(parsed, comment_meta)
         parsed['comment_module_coverage'] = coverage
         self._upgrade_comment_count_from_module(parsed, coverage)
+        audit += (
+            f" 列表:{coverage['list_count']} 模块声明:{coverage['module_total']} "
+            f"返回:{coverage['returned']}/{coverage['expected']} "
+            f"覆盖率:{coverage['ratio']:.0%} "
+            f"作者排除:{comment_meta.get('author_count', 0)} 非作者:{len(samples)}"
+        )
 
         if not coverage['representative']:
             if coverage['expected'] >= CONFIG['comment_module_undercovered_skip_min_comments']:
@@ -2488,19 +2532,19 @@ class SmzdmScraper:
                 parsed.pop('comment_level_stats', None)
                 parsed.pop('comment_level_unavailable_reason', None)
                 logging.info(
-                    f"[评论模块覆盖不足，跳过等级判断] {parsed['title'][:40]}... | "
+                    f"[评论模块覆盖不足，跳过等级判断] {parsed['title'][:40]}... | {audit} "
                     f"列表评论:{coverage['list_count']} 模块声明:{coverage['module_total']} "
                     f"返回评论:{coverage['returned']} "
                     f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
                     f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
-                    f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                    f"评分:{parsed.get('composite_score', 0)} 值票支持率:{parsed.get('score_rate', 0)}%"
                 )
                 return True
 
             self._mark_comment_level_unavailable(parsed, 'sample')
             parsed.pop('comment_level_stats', None)
             logging.info(
-                f"[评论模块覆盖不足，暂缓] {parsed['title'][:40]}... | "
+                f"[评论模块覆盖不足，暂缓] {parsed['title'][:40]}... | {audit} "
                 f"列表评论:{coverage['list_count']} 模块声明:{coverage['module_total']} "
                 f"返回评论:{coverage['returned']} "
                 f"覆盖率:{coverage['ratio']:.0%} 模块评论:{comment_meta.get('module_total', 0)} "
@@ -2521,13 +2565,13 @@ class SmzdmScraper:
                     )
                     parsed.pop('comment_level_unavailable_reason', None)
                     logging.info(
-                        f"[评论大区少样本通过] {parsed['title'][:40]}... | "
+                        f"[评论大区少样本通过] {parsed['title'][:40]}... | {audit} "
                         f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
                         f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
                         f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
                         f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
                         f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
-                        f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                        f"评分:{parsed.get('composite_score', 0)} 值票支持率:{parsed.get('score_rate', 0)}%"
                     )
                     return True
 
@@ -2536,18 +2580,18 @@ class SmzdmScraper:
                     parsed['comment_level_note'] = '少样本通过'
                     parsed.pop('comment_level_unavailable_reason', None)
                     logging.info(
-                        f"[评论等级少样本通过] {parsed['title'][:40]}... | "
+                        f"[评论等级少样本通过] {parsed['title'][:40]}... | {audit} "
                         f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)}="
                         f"{level_stats['low_ratio']:.0%}, "
                         f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
                         f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
-                        f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                        f"评分:{parsed.get('composite_score', 0)} 值票支持率:{parsed.get('score_rate', 0)}%"
                     )
                     return True
 
                 self._mark_comment_level_unavailable(parsed, 'sample')
                 logging.info(
-                    f"[评论等级不足，跳过] {parsed['title'][:40]}... | "
+                    f"[评论等级不足，跳过] {parsed['title'][:40]}... | {audit} "
                     f"API评论:{parsed['comments']} 可取评论:{len(samples)} "
                     f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
                     f"作者:{comment_meta.get('author_count', 0)} "
@@ -2566,19 +2610,19 @@ class SmzdmScraper:
                 )
                 parsed.pop('comment_level_unavailable_reason', None)
                 logging.info(
-                    f"[评论大区少样本通过] {parsed['title'][:40]}... | "
+                    f"[评论大区少样本通过] {parsed['title'][:40]}... | {audit} "
                     f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
                     f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
                     f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
                     f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
                     f"独立用户:{level_stats['unique_users']}/{len(samples)} | "
-                    f"评分:{parsed.get('composite_score', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                    f"评分:{parsed.get('composite_score', 0)} 值票支持率:{parsed.get('score_rate', 0)}%"
                 )
                 return True
 
             self._mark_comment_level_unavailable(parsed, 'sample')
             logging.info(
-                f"[评论大区样本不足，跳过] {parsed['title'][:40]}... | "
+                f"[评论大区样本不足，跳过] {parsed['title'][:40]}... | {audit} "
                 f"API评论:{parsed['comments']} 模块评论:{comment_meta.get('module_total', 0)} "
                 f"原始样本:{comment_meta.get('all_count', 0)} 作者:{comment_meta.get('author_count', 0)} "
                 f"非作者:{len(samples)} Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
@@ -2593,7 +2637,7 @@ class SmzdmScraper:
 
         if low_ratio > CONFIG['comment_level_max_low_ratio']:
             logging.warning(
-                f"[评论等级水军过滤] {parsed['title'][:40]}... | "
+                f"[评论等级水军过滤] {parsed['title'][:40]}... | {audit} "
                 f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
                 f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
             )
@@ -2602,7 +2646,7 @@ class SmzdmScraper:
         if (len(samples) >= CONFIG['comment_concentration_min_comments']
                 and level_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
             logging.warning(
-                f"[评论集中水军过滤] {parsed['title'][:40]}... | "
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
                 f"独立用户:{level_stats['unique_users']}/{len(samples)}"
             )
             return False
@@ -2610,7 +2654,7 @@ class SmzdmScraper:
         if (len(samples) >= CONFIG['comment_concentration_min_comments']
                 and level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
             logging.warning(
-                f"[评论集中水军过滤] {parsed['title'][:40]}... | "
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
                 f"最高单用户:{level_stats['max_user_comments']}/{len(samples)}={level_stats['max_user_ratio']:.0%}"
             )
             return False
@@ -2619,7 +2663,7 @@ class SmzdmScraper:
         parsed.pop('comment_level_note', None)
         parsed.pop('comment_level_unavailable_reason', None)
         logging.info(
-            f"[评论等级通过] {parsed['title'][:40]}... | "
+            f"[评论等级通过] {parsed['title'][:40]}... | {audit} "
             f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
             f"Lv>={CONFIG['comment_level_high_min']} {high_count} | "
             f"独立用户:{level_stats['unique_users']}/{len(samples)}"
@@ -2783,7 +2827,7 @@ class SmzdmScraper:
                 f"[早期强信号评论放行] {parsed['title'][:40]}... | "
                 f"原因:{reason} 评分:{parsed.get('composite_score', 0)} "
                 f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
-                f"值:{parsed.get('worthy', 0)} 好评率:{parsed.get('score_rate', 0)}%"
+                f"值:{parsed.get('worthy', 0)} 值票支持率:{parsed.get('score_rate', 0)}%"
             )
             return False
 
@@ -2803,7 +2847,7 @@ class SmzdmScraper:
                 f"[评论等级兜底放行] {parsed['title'][:40]}... | "
                 f"已暂缓 {pending_count} 轮仍不可用，当前路径:{quality_path} 原因:{reason} "
                 f"评分:{parsed.get('composite_score', 0)} 评论:{parsed.get('comments', 0)} "
-                f"好评率:{parsed.get('score_rate', 0)}%"
+                f"值票支持率:{parsed.get('score_rate', 0)}%"
             )
             return False
 
@@ -3013,7 +3057,7 @@ class SmzdmScraper:
             self.stats['total_filtered_trend_stale'] += 1
             trend = parsed.get('trend_metrics') or {}
             logging.warning(
-                f"[增长停滞过滤] {parsed['title'][:40]}... | "
+                f"[增长停滞过滤] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
                 f"已观察:{trend.get('elapsed_minutes', 0)}分钟 "
                 f"增长分:{trend.get('growth_score', 0)} "
                 f"评论:{parsed.get('comments', 0)} 收藏:{parsed.get('collection', 0)} "
@@ -3049,7 +3093,7 @@ class SmzdmScraper:
 
         if len(reasons) >= CONFIG['shill_min_flags']:
             logging.warning(
-                f"[水军嫌疑] {parsed['title'][:40]}... | "
+                f"[水军嫌疑] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
                 + " | ".join(reasons)
             )
             return False
@@ -3077,165 +3121,317 @@ class SmzdmScraper:
     # ==================== 推送 ====================
 
     def _send_notification(self, data):
-        """WXPusher 微信推送"""
-        content = self._build_notification_content(data)
+        """确认目标接收人的发送任务已创建；不代表异步消息已经到达。"""
+        data.pop('push_send_record_id', None)
+
+        def failed(reason, unknown=False):
+            self.stats['total_push_failed'] += 1
+            if unknown:
+                self.stats['total_push_unknown'] += 1
+            logging.error(f"[推送{'结果未知' if unknown else '失败'}] {self._candidate_log_context(data)} {reason}")
+            return False
+
+        def safe_field(value):
+            # 接口状态可能回显鉴权信息，不记录原始响应或异常正文。
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                return '-'
+            text = str(value)
+            for secret in (APP_TOKEN, UID):
+                if secret:
+                    text = text.replace(secret, '[已隐藏]')
+            return re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', text)[:120]
+
+        if not isinstance(UID, str) or not UID or re.search(r'[\s\x00-\x1f\x7f,;]', UID):
+            return failed('接收人配置为空或不是单个有效 UID')
 
         try:
+            content = self._build_notification_content(data)
             response = requests.post(
                 'https://wxpusher.zjiecode.com/api/send/message',
                 json={
                     "appToken": APP_TOKEN,
                     "content": content,
+                    "summary": self._build_notification_summary(data),
                     "contentType": 2,
                     "uids": [UID]
                 },
                 timeout=10
             )
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('success'):
-                    metrics = self._current_interaction_metrics(data)
-                    logging.info(
-                        f"[推送成功] {data['title'][:40]}... | "
-                        f"id:{data.get('id') or data.get('article_id', '-')} "
-                        f"路径:{data.get('quality_path', '未知')} "
-                        f"价格:{data.get('price', '-')} "
-                        f"评分:{metrics['composite_score']} "
-                        f"好评率:{metrics['score_rate']}% "
-                        f"评论:{data.get('comments', 0)} "
-                        f"收藏:{data.get('collection', 0)} "
-                        f"值:{data.get('worthy', 0)} "
-                        f"不值:{data.get('unworthy', 0)}"
-                    )
-                    return True
-                else:
-                    logging.error(f"[推送失败] {result.get('msg', 'unknown')}")
-                    return False
+            if response.status_code != 200:
+                return failed(f'HTTP {response.status_code}')
+
+            result = response.json()
+            if not isinstance(result, dict):
+                return failed('接口返回的 JSON 不是对象')
+            if result.get('success') is not True or result.get('code') != 1000:
+                return failed(f"接口业务码:{safe_field(result.get('code'))}")
+            recipients = result.get('data')
+            if not isinstance(recipients, list):
+                return failed('接口缺少接收人结果数组')
+            target_results = [
+                recipient for recipient in recipients
+                if isinstance(recipient, dict) and recipient.get('uid') == UID
+            ]
+            if len(target_results) != 1:
+                return failed('接口未返回唯一的目标接收人结果')
+            target = target_results[0]
+            recipient_code = safe_field(target.get('code'))
+            recipient_status = safe_field(target.get('status'))
+            record_id = target.get('sendRecordId')
+            if isinstance(record_id, int) and not isinstance(record_id, bool) and record_id > 0:
+                record_id = str(record_id)
+            elif isinstance(record_id, str) and re.fullmatch(r'[0-9]{1,30}', record_id):
+                pass
             else:
-                logging.error(f"[推送失败] HTTP {response.status_code}")
-                return False
+                record_id = ''
+            delivery_note = (
+                f"接收人code:{recipient_code} status:{recipient_status} "
+                f"sendRecordId:{record_id or '-'}"
+            )
+            if target.get('code') != 1000:
+                return failed(delivery_note)
+
+            data['push_send_record_id'] = record_id
+            metrics = self._current_interaction_metrics(data)
+            logging.info(
+                f"[推送成功] {data['title'][:40]}... | "
+                f"{self._candidate_log_context(data)} "
+                f"路径:{data.get('quality_path', '未知')} "
+                f"价格:{data.get('price', '-')} "
+                f"评分:{metrics['composite_score']} "
+                f"值票支持率:{metrics['score_rate']}% "
+                f"评论:{data.get('comments', 0)} "
+                f"收藏:{data.get('collection', 0)} "
+                f"值:{data.get('worthy', 0)} "
+                f"不值:{data.get('unworthy', 0)} | "
+                f"{delivery_note}（发送任务已创建，异步到达未确认）"
+            )
+            return True
+        except requests.Timeout:
+            # POST 超时无法判断服务端是否创建了任务，不立即重试以免重复通知。
+            return failed('POST 超时，未即时重试；服务端是否接受未知', unknown=True)
+        except ValueError:
+            return failed('接口 JSON 无法解析')
         except Exception as e:
-            logging.error(f"[推送异常] {e}")
-            return False
+            return failed(f'异常类型:{type(e).__name__}')
+
+    @staticmethod
+    def _notification_plain_text(value):
+        text = re.sub(r'<[^>]*>', '', html.unescape(str(value or '')))
+        return re.sub(r'\s+', ' ', text).strip()
+
+    def _notification_short_title(self, data):
+        title = self._notification_plain_text(data.get('title')) or '商品名称见详情'
+        # 只移除开头的促销标签，保留品牌、型号、规格和商品名中的 Plus 等词。
+        prefix = re.compile(
+            r'^(?:PLUS会员|88VIP|值友专享|今日必买|每日必抢|百亿补贴|国家补贴|'
+            r'大件超省|移动端|淘金币可用|淘金币\d+(?:\.\d+)?元|限地区|凑单品)'
+            r'[\s:：,，、]+', re.IGNORECASE,
+        )
+        while prefix.search(title):
+            title = prefix.sub('', title, count=1).strip()
+        return title
+
+    def _notification_purchase_conditions(self, data):
+        title = self._notification_plain_text(data.get('title'))
+        price = self._notification_plain_text(data.get('price'))
+        text = f'{title} {price}'
+        conditions = []
+        # 影响支付/返还的条件放在前面；不把“4件套”误读为需要买4件。
+        if re.search(r'返.{0,8}[eE]卡', price):
+            conditions.append('含返E卡')
+        if re.search(r'返.{0,8}积分', price):
+            conditions.append('含返积分')
+        quantity = re.search(r'(?:需买|需购|须买|拍)\s*(\d+)\s*件', text)
+        if quantity:
+            conditions.append(f'需买{quantity.group(1)}件')
+        if '88vip' in text.lower():
+            conditions.append('88VIP')
+        if 'plus会员' in text.lower():
+            conditions.append('PLUS会员')
+        if re.search(r'国家补贴|国补', text):
+            conditions.append('国补条件')
+        if '淘金币' in text:
+            conditions.append('淘金币')
+        if re.search(r'需用券|用券|券后', text):
+            conditions.append('需用券')
+        if '限地区' in text:
+            conditions.append('限地区')
+        if '凑单品' in title:
+            conditions.append('凑单品')
+        if '移动端' in title:
+            conditions.append('移动端')
+        if '随机免单' in title:
+            conditions.append('随机免单活动')
+        if re.search(r'(?:评论|晒单|评价).{0,8}(?:送|返|奖励)', text):
+            conditions.append('晒单/评论奖励')
+        return conditions
+
+    def _notification_display_price(self, data):
+        raw_price = self._notification_plain_text(data.get('price'))
+        number = r'\d+(?:,\d{3})*(?:\.\d+)?'
+        match = re.match(
+            rf'^(?:低至|折合|折算|约)?\s*(?:{number}(?:\s*元)?\s*[-~—至]\s*{number}\s*元|{number}\s*元)(?:\s*起)?',
+            raw_price,
+        )
+        if not match:
+            if not raw_price or raw_price == '未知':
+                return '价格见详情'
+            return raw_price if len(raw_price) <= 40 else '复杂价格见详情'
+        price = match.group(0).replace(' ', '')
+        # 不能把“返100元E卡后194元”中的返还额当售价；仅简化明确的起始售价。
+        if raw_price[match.end():].startswith(('/', '每')):
+            return raw_price if len(raw_price) <= 40 else '复杂价格见详情'
+        if (not price.startswith(('折算', '折合'))
+                and re.search(r'返.{0,20}(?:积分|[eE]卡).{0,8}后', raw_price)):
+            return f'折算{price}'
+        return price
+
+    def _notification_reasons(self, data):
+        """只描述可核对的信号，不用互动分数宣称低价或商品质量。"""
+        reasons = []
+        price_drop_note = self._notification_plain_text(data.get('price_drop_note'))
+        if price_drop_note:
+            reasons.append(price_drop_note)
+        trend = data.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0) > 0:
+            if (trend.get('recent_minutes', 0) <= CONFIG['warming_recent_max_minutes']
+                    and trend.get('recent_growth_score', 0) > 0):
+                minutes = int(trend.get('recent_minutes', 0))
+                worthy = int(trend.get('recent_delta_worthy', 0))
+                collection = int(trend.get('recent_delta_collection', 0))
+            elif (trend.get('elapsed_minutes', 0) <= CONFIG['trend_display_recent_after_minutes']
+                    and trend.get('growth_score', 0) > 0):
+                minutes = int(trend.get('elapsed_minutes', 0))
+                worthy = int(trend.get('delta_worthy', 0))
+                collection = int(trend.get('delta_collection', 0))
+            else:
+                worthy = collection = 0
+                minutes = 0
+            growth = []
+            if worthy > 0:
+                growth.append(f'新增{worthy}个值票')
+            if collection > 0:
+                growth.append(f'{collection}个收藏')
+            if growth:
+                reasons.append(f'{max(1, minutes)}分钟内' + '、'.join(growth))
+        if data.get('rank_position'):
+            reasons.append(
+                f"{int(data.get('rank_window_hours') or 12)}小时热榜第{int(data['rank_position'])}名"
+            )
+        if not reasons:
+            reasons.append(f"{data.get('worthy', 0)}个值票、{data.get('comments', 0)}条评论")
+        return reasons
+
+    def _build_notification_summary(self, data):
+        """WXPusher 最多100字符；价格和购买门槛在可能被截断的商品名前。"""
+        price = self._notification_display_price(data)
+        conditions = self._notification_purchase_conditions(data)
+        compact_conditions = {
+            '含返E卡': '返E卡', '含返积分': '返积分', '国补条件': '国补',
+            '需用券': '用券', '随机免单活动': '随机免单', '晒单/评论奖励': '评论奖励',
+        }
+        condition_text = '/'.join(compact_conditions.get(value, value) for value in conditions)
+        reason = self._notification_reasons(data)[0]
+        reason = re.sub(r'较历史(?:同 SKU|相似商品)推送低', '较此前推送低', reason)
+        for original, short in (
+            ('分钟内新增', '分钟增'), ('个值票', '值'), ('个收藏', '藏'), ('条评论', '评'),
+        ):
+            reason = reason.replace(original, short)
+        if not data.get('price_drop_note'):
+            reason += '；价差未核实'
+        reason = reason[:36]
+        prefix = '｜'.join(part for part in (price, condition_text) if part)
+        title_budget = max(8, min(24, 100 - len(prefix) - len(reason) - 2))
+        title = self._notification_short_title(data)
+        if len(title) > title_budget:
+            title = title[:title_budget - 1] + '…'
+        return f'{prefix}｜{title}｜{reason}'[:100]
+
+    @staticmethod
+    def _notification_safe_url(value):
+        # HTML escaping alone cannot make a javascript: URL safe.
+        text = str(value or '').strip()
+        if re.match(r'^https?://[^\s<>"\']+$', text, re.IGNORECASE):
+            return html.escape(text, quote=True)
+        return ''
 
     def _build_notification_content(self, data):
-        """生成 WXPusher HTML 内容。"""
-        score_rate = data.get('score_rate', 0)
-        composite_score = data.get('composite_score', 0)
-        quality_path = data.get('quality_path', '综合筛选')
-        level_stats = data.get('comment_level_stats') or {}
-        comment_level_note = data.get('comment_level_note')
-        comment_count_note = data.get('comment_count_note')
-        comment_module_coverage = data.get('comment_module_coverage') or {}
-        trend = data.get('trend_metrics') or {}
-        price_drop_note = data.get('price_drop_note')
-        rank_position = data.get('rank_position')
-
-        if data.get('quality_path') == '超级好价':
-            score_tag = '💎超'
-            score_label = '超级好价'
-        elif composite_score >= 100:
-            score_tag = '🔥爆'
-            score_label = '高热度'
-        elif data.get('quality_path') == '升温好价':
-            score_tag = '📈升'
-            score_label = '持续升温'
-        elif composite_score >= 60:
-            score_tag = '👍热'
-            score_label = '值得看'
+        """购物决策信息在前，内部筛选诊断在后。"""
+        escape = lambda value: html.escape(str(value), quote=True)
+        title = escape(self._notification_short_title(data))
+        price = escape(self._notification_display_price(data))
+        raw_price = self._notification_plain_text(data.get('price'))
+        conditions = self._notification_purchase_conditions(data)
+        conditions_line = ''
+        if conditions:
+            conditions_line = (
+                '<div style="margin-top:8px;color:#b45309;">购买条件：'
+                + escape(' / '.join(conditions)) + '</div>'
+            )
+        raw_price_line = ''
+        if raw_price and raw_price != self._notification_display_price(data):
+            raw_price_line = (
+                '<div style="margin-top:6px;">原文价格：' + escape(raw_price) + '</div>'
+            )
+        if any(condition in conditions for condition in ('含返积分', '含返E卡')):
+            raw_price_line += '<div style="color:#777;">涉及返还条件，实际支付和返还请分别核对。</div>'
+        reasons = ''.join('<li>' + escape(reason) + '</li>'
+                          for reason in self._notification_reasons(data))
+        if data.get('price_drop_note'):
+            price_reference = '价格对照来自本监控此前推送，购买条件可能不同，请核对原文。'
         else:
-            score_tag = '🆕新'
-            score_label = '早期信号'
-
-        title = html.escape(str(data.get('title', '未知商品')), quote=True)
-        mall = html.escape(str(data.get('mall', '未知')), quote=True)
-        price = html.escape(str(data.get('price', '未知')), quote=True)
-        pub_time = html.escape(str(data.get('pub_time', '')), quote=True)
-        link = html.escape(str(data.get('link', '')), quote=True)
-        quality_path = html.escape(str(quality_path), quote=True)
-
-        level_line = ''
-        if level_stats:
-            low = level_stats.get('low', 0)
-            count = level_stats.get('count', 0)
-            high = level_stats.get('high', 0)
-            low_ratio = int(level_stats.get('low_ratio', 0) * 100)
-            unique_users = level_stats.get('unique_users', 0)
-            max_user_comments = level_stats.get('max_user_comments', 0)
-            level_line = (
-                f"👤 评论等级：Lv5及以下 {low}/{count}（{low_ratio}%）"
-                f" | Lv6及以上 {high}<br>"
-                f"👥 评论用户：独立 {unique_users}/{count} | 单人最多 {max_user_comments}<br>"
+            price_reference = '尚无可比历史价，价格优势待核实。'
+        metrics = self._current_interaction_metrics(data)
+        worthy = int(data.get('worthy', 0))
+        unworthy = int(data.get('unworthy', 0))
+        votes = worthy + unworthy
+        vote_line = f'{worthy} 值 / {unworthy} 不值'
+        if votes:
+            vote_line += f"（值票支持率 {metrics['score_rate']}%，共 {votes} 票）"
+        else:
+            vote_line += '（暂无投票）'
+        link = self._notification_safe_url(data.get('link'))
+        link_line = (
+            f'<div style="margin:16px 0;"><a href="{link}" '
+            'style="font-size:17px;font-weight:bold;">查看好价与购买方法 →</a></div>'
+        ) if link else '<div style="margin:16px 0;">购买链接暂不可用</div>'
+        coverage = data.get('comment_module_coverage') or {}
+        diagnostics = [
+            f"互动分 {metrics['composite_score']} · 路径 {data.get('quality_path', '综合筛选')}"
+        ]
+        if coverage.get('expected'):
+            returned = int(coverage.get('returned') or 0)
+            expected = int(coverage['expected'])
+            status = '覆盖足够' if coverage.get('representative') else '覆盖不足，仅作参考'
+            diagnostics.append(f'评论样本 {returned}/{expected}，{status}')
+        level_note = self._notification_plain_text(data.get('comment_level_note'))
+        if level_note:
+            level_note = level_note.replace('评论等级未确认:sample', '评论等级样本不足')
+            diagnostics.append(level_note)
+        trend = data.get('trend_metrics') or {}
+        if trend.get('snapshot_count', 0):
+            diagnostics.append(
+                f"本文章已观察 {int(trend.get('elapsed_minutes', 0))} 分钟，"
+                f"增长分 {trend.get('growth_score', 0)}"
             )
-        note_line = ''
-        if comment_level_note:
-            note_line = f"🧪 评论判断：{html.escape(str(comment_level_note), quote=True)}<br>"
-        comment_count_suffix = ''
-        if comment_count_note:
-            comment_count_suffix = (
-                f" <span style=\"color:#777;\">"
-                f"({html.escape(str(comment_count_note), quote=True)})</span>"
-            )
-        coverage_line = ''
-        if comment_module_coverage and comment_module_coverage.get('expected'):
-            returned = int(comment_module_coverage.get('returned') or 0)
-            expected = int(comment_module_coverage.get('expected') or 0)
-            ratio = int((comment_module_coverage.get('ratio') or 0) * 100)
-            coverage_status = '覆盖足够' if comment_module_coverage.get('representative') else '覆盖不足'
-            coverage_line = (
-                f"🧩 评论覆盖：{returned}/{expected}（{ratio}% / {coverage_status}）<br>"
-            )
-        trend_line = ''
-        if trend.get('snapshot_count', 0) > 0:
-            if trend.get('elapsed_minutes', 0) <= CONFIG['trend_display_recent_after_minutes']:
-                trend_line = (
-                    f"📈 增长：值 +{trend.get('delta_worthy', 0)} / "
-                    f"收藏 +{trend.get('delta_collection', 0)} / "
-                    f"评论 +{trend.get('delta_comments', 0)} "
-                    f"（{trend.get('elapsed_minutes', 0)}分钟，增长分 {trend.get('growth_score', 0)}，"
-                    f"{trend.get('growth_per_hour', 0)}/h）<br>"
-                )
-            elif trend.get('recent_growth_score', 0) > 0:
-                trend_line = (
-                    f"📈 近一轮增长：值 +{trend.get('recent_delta_worthy', 0)} / "
-                    f"收藏 +{trend.get('recent_delta_collection', 0)} / "
-                    f"评论 +{trend.get('recent_delta_comments', 0)} "
-                    f"（{trend.get('recent_minutes', 0)}分钟，增长分 {trend.get('recent_growth_score', 0)}，"
-                    f"{trend.get('recent_growth_per_hour', 0)}/h）<br>"
-                )
-        price_drop_line = ''
-        if price_drop_note:
-            price_drop_line = f"📉 降价：{html.escape(str(price_drop_note), quote=True)}<br>"
-        rank_line = ''
-        if rank_position:
-            rank_line = (
-                f"🏆 来源：{int(data.get('rank_window_hours') or 12)}小时热榜 "
-                f"#{int(rank_position)}<br>"
-            )
-
+        diagnostic_lines = '<br>'.join(escape(line) for line in diagnostics)
         return f"""
-        <div style="font-size:15px;line-height:1.65;">
-          <div style="font-size:17px;font-weight:bold;margin-bottom:8px;">
-            {score_tag}【{mall}】{title}
-          </div>
-          <div>
-            💰 <span style="color:#e62828;font-size:18px;font-weight:bold;">{price}</span>
-            <span style="color:#666;">（{score_label} / {quality_path}）</span>
-          </div>
-          <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
-          🕒 发布：{pub_time}<br>
-          📊 好评率：{score_rate}% | 综合评分：{composite_score}<br>
-          {rank_line}
-          {price_drop_line}
-          👍 值：{data['worthy']} | 👎 不值：{data['unworthy']}<br>
-          💬 评论：{data['comments']}{comment_count_suffix} | ⭐ 收藏：{data['collection']}<br>
-          {trend_line}
-          {coverage_line}
-          {level_line}
-          {note_line}
-          <div style="margin-top:10px;">
-            🔗 <a href="{link}">查看 SMZDM 详情</a>
-          </div>
+        <div style="font-size:15px;line-height:1.7;">
+          <div style="font-size:21px;font-weight:bold;color:#e62828;">{price}</div>
+          <div style="font-size:18px;font-weight:bold;margin-top:8px;">{title}</div>
+          <div style="color:#777;margin-top:5px;">{escape(data.get('mall', '未知平台'))} · 发布 {escape(data.get('pub_time', ''))}</div>
+          {conditions_line}
+          {raw_price_line}
+          <hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">
+          <div style="font-weight:bold;">这次为什么推送</div>
+          <ul style="padding-left:22px;margin:6px 0;">{reasons}</ul>
+          <div style="color:#777;">{escape(price_reference)}</div>
+          <div style="margin-top:12px;">{escape(vote_line)}<br>
+          {int(data.get('comments', 0))} 条评论 · {int(data.get('collection', 0))} 个收藏</div>
+          {link_line}
+          <hr style="border:none;border-top:1px solid #ddd;margin:14px 0;">
+          <div style="font-size:12px;color:#888;">筛选记录<br>{diagnostic_lines}</div>
         </div>
         """
 
@@ -3386,9 +3582,9 @@ class SmzdmScraper:
             self.conn.execute(
                 '''
                 INSERT OR REPLACE INTO history (
-                    id, title, fingerprint, product_key, mall, price, price_value, last_seen
+                    id, title, fingerprint, product_key, mall, price, price_value, send_record_id, last_seen
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''',
                 (
                     data['id'],
@@ -3398,6 +3594,7 @@ class SmzdmScraper:
                     data.get('mall', ''),
                     data.get('price', ''),
                     data.get('price_value'),
+                    data.get('push_send_record_id', ''),
                 )
             )
             self.conn.commit()
@@ -3511,6 +3708,8 @@ class SmzdmScraper:
         logging.info(f"  增长过慢过滤: {self.stats['total_filtered_trend_slow']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
+        logging.info(f"  推送失败: {self.stats['total_push_failed']}")
+        logging.info(f"    POST 超时结果未知: {self.stats['total_push_unknown']}")
         if self.quality_path_sent_counts:
             sent_summary = ", ".join(
                 f"{path}:{count}"

@@ -151,10 +151,49 @@ class SmzdmFilterTests(unittest.TestCase):
         )
         self.assertEqual(metrics["score_rate"], 0)
 
+    def test_representative_comment_rejection_logs_article_and_coverage(self):
+        with patch("smzdm.DB_PATH", ":memory:"):
+            scraper = SmzdmScraper()
+        self.addCleanup(scraper._cleanup)
+        data = {
+            "id": "111", "title": "测试商品", "late_recheck_source": True,
+            "comments": 4, "worthy": 6, "unworthy": 0, "collection": 8,
+        }
+        samples = [
+            {"user_id": "u1", "level": 3},
+            {"user_id": "u2", "level": 4},
+            {"user_id": "u3", "level": 8},
+        ]
+        meta = {"module_total": 4, "all_count": 4, "author_count": 1}
+        with patch.object(scraper, "_fetch_comment_samples", return_value=(samples, meta)):
+            with self.assertLogs(level="WARNING") as logs:
+                self.assertFalse(scraper._check_comment_user_levels(data))
+        message = "\n".join(logs.output)
+        for field in ("id:111", "来源:延迟详情", "返回:4/4", "覆盖率:100%", "作者排除:1"):
+            self.assertIn(field, message)
+
+    def test_undercovered_low_level_samples_remain_diagnostic(self):
+        with patch("smzdm.DB_PATH", ":memory:"):
+            scraper = SmzdmScraper()
+        self.addCleanup(scraper._cleanup)
+        data = {"id": "112", "title": "测试商品", "comments": 12,
+                "worthy": 6, "unworthy": 0, "collection": 8}
+        samples = [{"user_id": f"u{index}", "level": 3} for index in range(3)]
+        meta = {"module_total": 12, "all_count": 4, "author_count": 1}
+        with patch.object(scraper, "_fetch_comment_samples", return_value=(samples, meta)):
+            self.assertTrue(scraper._check_comment_user_levels(data))
+        self.assertFalse(scraper._should_defer_for_comment_unavailable(data))
+        self.assertEqual(scraper.stats["total_comment_level_undercovered_skipped"], 1)
+
+    @patch("smzdm.UID", "UID_test")
     @patch("smzdm.requests.post")
     def test_successful_push_logs_review_fields(self, mock_post):
         mock_post.return_value.status_code = 200
-        mock_post.return_value.json.return_value = {"success": True}
+        mock_post.return_value.json.return_value = {
+            "success": True, "code": 1000,
+            "data": [{"uid": "UID_test", "code": 1000, "sendRecordId": 12313}],
+        }
+        self.scraper.stats = {"total_push_failed": 0, "total_push_unknown": 0}
         data = {
             "id": "178999999",
             "title": "测试商品",

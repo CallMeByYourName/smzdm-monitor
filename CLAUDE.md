@@ -1,12 +1,14 @@
 # CLAUDE.md
 
-This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-07-27`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-10`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
 ## Project
 
 SMZDM (什么值得买) deal monitor. `smzdm.py` performs one scan, filters candidates, sends accepted deals through WXPusher, saves state in SQLite, and exits. Scheduling is external; there is no local polling loop.
 
 The project deliberately treats list engagement and snapshot growth as its primary evidence. SMZDM does not expose a reliable complete distribution of comment-user levels through the endpoint available to GitHub Actions, and JD store/self-operated fields are also unreliable on hosted runners. Missing external data is diagnostic rather than a default rejection.
+
+Keep discovery broad. The user wants price, product, purchase conditions, and a factual reason visible before opening a notification; do not infer a global category blacklist or claim that engagement establishes price advantage or superior quality. Brand names or a low price cannot certify product quality. Formatting reuses existing data without new external requests.
 
 ## Commands
 
@@ -48,9 +50,13 @@ All paths require at least two worthy votes or two comments. Inactive items are 
 
 The script has no broad category blacklist. Its narrow normalized-regex filter targets non-product tasks and reward pages, including variable `入会...京豆`, follow/add-to-cart/sign-in rewards, reward-day/E-card sequences, store-only titles, livestream rooms, coupon roundups, points conversion, popup red packets, ambiguous campaign pages, and the concrete variants found in Actions logs. Title filtering runs before snapshot persistence; late rechecks also retire blocked legacy rows and backfill the bounded request budget. Add paired blocked and allowed regression tests whenever changing title expressions.
 
+Store-only filtering must preserve concrete product categories, models, and specifications in titles ending with `官方旗舰店`; the suffix alone does not identify a task page.
+
 ## Trends
 
 `candidate_snapshots` retains two days of interactions. Growth weights are worthy 3, collection 2, comments 4, and unworthy -2.
+
+Trend queries and per-run snapshot deduplication use article ID. Different articles for one SKU/fingerprint cannot share interaction growth. Legacy SKU/fingerprint-keyed snapshots remain available only to their original article ID; SKU/fingerprint still serves product push deduplication.
 
 - Low-confidence early paths wait for meaningful later growth, including at least one new worthy vote, unless current engagement meets a mature/discussion bypass.
 - Warming deals require recent or sufficiently fast short-window growth. Comment-only, collection-only, or very old slow growth cannot qualify.
@@ -79,13 +85,31 @@ Hard level/concentration decisions require a representative module response: abo
 
 JD self-operated hard filtering is disabled (`jd_self_filter_enabled = False`) because hosted runners cannot reliably retrieve store or `isSelf` data. JD follows the same generic quality rules as every other platform.
 
-Only successful pushes are recorded. Dedup uses article ID, platform product key when available, and normalized title fingerprint. Fingerprints remain active for 30 days. A matching SKU or fingerprint can be pushed again when the parsed price drops by at least RMB 5 or 5% from the previous minimum.
+Only sends accepted for the target UID are recorded: require WXPusher outer `success`/`code` and target UID `code=1000`, and save `send_record_id`. This confirms an accepted asynchronous task, not terminal arrival or reading. Dedup uses article ID, platform product key when available, and normalized title fingerprint. Fingerprints remain active for 30 days. A matching SKU or fingerprint can be pushed again when the parsed price drops by at least RMB 5 or 5% from the previous minimum.
+
+Price comparison excludes rebates, coupon thresholds/face values, gifts, and original prices. Startup recalculates stored history price values to correct legacy rebate amounts mistaken for sale prices.
+
+## Notifications and Diagnostics
+
+Use a separate price-first WXPusher `summary` of at most 100 characters, with purchase conditions before the short product name, followed by a concise factual reason. Strip leading marketing prefixes while preserving recognizable `88VIP`/`PLUS会员`, required quantities, subsidy, Tao-coin, coupon, regional, add-on, mobile-only, random-free-order, and review-reward conditions from title/price.
+
+Label rebates `含返E卡`/`含返积分`; add `折算` only when original wording explicitly gives a price after rebate. Do not assume `119.9元（返240积分）` already subtracts the points. Preserve starting-price, range, unit-price, and complex-rebate semantics, and retain original price text so payment and rebate can be checked separately.
+
+HTML details lead with actual same-article worthy/collection growth, the fetched rank window/position, or a reduction from this project's historical pushed price; fall back to current worthy/comment counts. Historical pushed price is not market/all-time-low evidence. Without a historical price-drop note, the summary says `价差未核实` and details say price advantage needs checking. Prior-push comparisons may also have different purchase conditions.
+
+Display `score_rate` as `值票支持率` (worthy/(worthy+unworthy)), with concrete vote counts. It is not buyer product-review approval. After the purchase link, show concise diagnostics: quality path, composite score, observation/growth scores, comment coverage, and unavailable-level notes. Full user levels/concentration and trend baselines remain in audit logs. Escape external HTML text.
+
+Filter, comment, trend, and send logs include article ID/source. Record comment coverage and trend baseline article/time, and summarize send failures separately from Actions status. Keep app tokens and full recipient identifiers out of logs.
 
 ## Stability and Deployment
 
 Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment/late-detail failures suspend external checks for the rest of that run. Late-detail failures do not stop main-feed discovery and recover on the next scheduled run.
 
-`.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, and `actions/cache` for SQLite.
+GET retries set `respect_retry_after_header=False`; do not let a 429 Retry-After header hold the run outside its bounded window before the circuit breaker can inspect it. WXPusher POST is not immediately retried. A timeout has unknown outcome and does not enter success history; a later scan may reevaluate it, so duplicate delivery is still possible.
+
+`.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, unit tests before scanning, and `actions/cache` for SQLite.
+
+Keep the 15-minute cadence based on the 2026-10-10 review: recent runs averaged about four minutes, 72/100 reached the row cap, and early signals benefit from timely repeat observations. Hosted-runner startup failures recover on the next scheduled run; do not add immediate redispatches without new evidence. See `analysis/smzdm-review-2026-10-10.md` for the dated pre-fix review.
 
 Manual runs accept optional `debug_article_id`; the workflow prints that article's cached candidate snapshots and matching successful-push history before scanning. Use it to investigate missing items from real stored metrics.
 
