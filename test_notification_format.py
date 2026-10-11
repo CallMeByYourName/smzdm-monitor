@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+from html.parser import HTMLParser
 
 from smzdm import SmzdmScraper
 
@@ -38,9 +39,12 @@ class NotificationFormatTests(unittest.TestCase):
                     price='8.88元（需买9件，需用券）')
         summary = self.scraper._build_notification_summary(data)
         self.assertLessEqual(len(summary), 100)
-        for condition in ('8.88元', '需买9件', '88VIP', '需用券'):
-            self.assertIn('用券' if condition == '需用券' else condition, summary)
-        self.assertLess(summary.index('需买9件'), summary.index('湾仔码头'))
+        for condition in ('8.88元', '需9件', '88VIP', '券'):
+            self.assertIn(condition, summary)
+        self.assertLess(summary.index('需9件'), summary.index('湾仔码头'))
+        content = self.scraper._build_notification_content(data)
+        self.assertIn('需买9件', content)
+        self.assertIn('需用券', content)
         self.assertNotIn('需买4件', self.scraper._build_notification_summary(
             dict(self.data, title='品牌 4件套 厨具', price='49元')))
 
@@ -135,6 +139,78 @@ class NotificationFormatTests(unittest.TestCase):
         self.assertNotIn('<img', content)
         self.assertNotIn('href="javascript:', content)
         self.assertIn('购买链接暂不可用', content)
+
+    def test_compact_conditions_bring_product_name_forward_without_dropping_membership(self):
+        data = dict(self.data, title='PLUS会员：冷酸灵 焕色美白专业修复牙膏',
+                    price='17.04元（需买2件，需用券）')
+        summary = self.scraper._build_notification_summary(data)
+        self.assertTrue(summary.startswith('17.04元｜需2件/PLUS/券｜冷酸灵'))
+        self.assertLess(summary.index('冷酸灵'), 20)
+        self.assertIn('价差未核实', summary)
+        self.assertIn('PLUS会员', self.scraper._build_notification_content(data))
+
+    def test_extreme_price_and_conditions_keep_uncertainty_and_product_in_bounded_summary(self):
+        data = dict(self.data,
+                    title='PLUS会员：88VIP、国家补贴、淘金币、限地区、凑单品、移动端、随机免单、'
+                          '晒单返奖励 品牌 商品型号 ABC123',
+                    price='12345678901234567890123456789012345678901234567890元起'
+                          '（需买99件，需用券，返100元E卡，返240积分）')
+        summary = self.scraper._build_notification_summary(data)
+        self.assertLessEqual(len(summary), 100)
+        self.assertTrue(summary.startswith('复杂价格见详情｜'))
+        self.assertIn('价差未核实', summary)
+        for condition in ('需99件', 'PLUS', '88VIP', '返E卡', '返积分', '国补', '券'):
+            self.assertIn(condition, summary)
+        self.assertIn('元起', self.scraper._build_notification_content(data))
+
+    def test_unusually_long_quantity_cannot_clip_product_and_price_uncertainty(self):
+        data = dict(self.data, title='PLUS会员：品牌 商品 ABC123',
+                    price='99元（需买' + '9' * 1000 + '件，需用券）')
+        summary = self.scraper._build_notification_summary(data)
+        self.assertLessEqual(len(summary), 100)
+        self.assertIn('数量见原文', summary)
+        self.assertIn('品牌 商品 ABC123', summary)
+        self.assertIn('价差未核实', summary)
+
+    def test_copy_attributes_retain_full_product_and_raw_link_without_injection(self):
+        class CopyParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.buttons = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag == 'copy':
+                    self.buttons.append(dict(attrs))
+
+        data = dict(self.data, title='88VIP：品牌 ABC Plus 98R69A "特别款" & 规格' + ' 原厂配件' * 15,
+                    link='https://www.smzdm.com/p/183730000/?a=1&b=%22quoted%22')
+        content = self.scraper._build_notification_content(data)
+        parser = CopyParser()
+        parser.feed(content)
+        self.assertEqual(len(parser.buttons), 2)
+        self.assertEqual(parser.buttons[0]['data-clipboard-text'],
+                         self.scraper._notification_short_title(data))
+        self.assertEqual(parser.buttons[1]['data-clipboard-text'], data['link'])
+        self.assertTrue(all(set(button) == {'style', 'data-clipboard-text'} for button in parser.buttons))
+        self.assertLess(content.index('复制商品名'), content.index('筛选记录'))
+        self.assertIn('&amp;b=', content)
+        bad_link = self.scraper._build_notification_content(dict(data, link='javascript:alert(1)'))
+        self.assertNotIn('复制原文链接', bad_link)
+        self.assertIn('复制商品名', bad_link)
+
+    def test_original_url_length_protocol_and_structure_are_validated_without_html_escaping(self):
+        url = 'https://www.smzdm.com/p/123/?a=1&b=2'
+        self.assertEqual(self.scraper._notification_original_url(url), url)
+        self.assertEqual(self.scraper._notification_safe_url(url), url.replace('&', '&amp;'))
+        valid_max = 'https://www.smzdm.com/' + 'x' * (1000 - len('https://www.smzdm.com/'))
+        self.assertEqual(self.scraper._notification_original_url(valid_max), valid_max)
+        for invalid in (None, [], '', 'javascript:alert(1)', 'jd://123', '//www.smzdm.com/',
+                        'http:///no-host', 'https://user:password@www.smzdm.com/',
+                        'https://www.smzdm.com:bad/', 'https://www.smzdm.com/\x00',
+                        'https://www.smzdm.com/\npath', 'https://www.smzdm.com/\\path',
+                        'https://www.smzdm.com/"quoted"', valid_max + 'x'):
+            with self.subTest(url=invalid):
+                self.assertEqual(self.scraper._notification_original_url(invalid), '')
 
 
 if __name__ == '__main__':

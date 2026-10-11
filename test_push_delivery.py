@@ -141,6 +141,25 @@ class PushDeliveryTests(unittest.TestCase):
         self.assert_no_history()
         self.assertNotIn('AT_private_test_token', '\n'.join(logs.output))
 
+    @patch('smzdm.requests.get')
+    @patch('smzdm.requests.post')
+    def test_original_link_is_sent_as_raw_json_and_no_status_query_is_added(self, post, get):
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = self.accepted_result()
+        link = 'https://www.smzdm.com/p/178999999/?a=1&b=2'
+        self.data['link'] = link
+        self.assertTrue(self.scraper._send_notification(self.data))
+        self.assertEqual(post.call_args.kwargs['json']['url'], link)
+        self.assertEqual(post.call_args.kwargs['json']['contentType'], 2)
+        self.assertNotIn('&amp;', post.call_args.kwargs['json']['url'])
+        get.assert_not_called()
+        for invalid in ('', 'javascript:alert(1)', 'jd://123', 'https://www.smzdm.com/' + 'x' * 1000):
+            with self.subTest(link=invalid):
+                self.data['link'] = invalid
+                self.assertTrue(self.scraper._send_notification(self.data))
+                self.assertNotIn('url', post.call_args.kwargs['json'])
+        get.assert_not_called()
+
     @patch('smzdm.requests.post')
     def test_post_timeout_is_unknown_and_is_not_retried(self, post):
         post.side_effect = requests.ReadTimeout('request included AT_private_test_token')

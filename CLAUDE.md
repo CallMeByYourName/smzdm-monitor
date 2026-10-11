@@ -103,6 +103,10 @@ Keyword rejection logs a sanitized INFO audit and independent count, not an oper
 
 Use a separate price-first WXPusher `summary` of at most 100 characters, with purchase conditions before the short product name, followed by a concise factual reason. Strip leading marketing prefixes while preserving recognizable `88VIP`/`PLUS会员`, required quantities, subsidy, Tao-coin, coupon, regional, add-on, mobile-only, random-free-order, and review-reward conditions from title/price.
 
+Summary condition wording is compact (`PLUS`, `需N件`, `券`) while details retain complete terms. Reserve space for the product and unverified-price note; extreme combined quotations show `复杂价格见详情` rather than clipping away uncertainty, and abnormally long quantities show `数量见原文`. Set the independent JSON `url` to the existing valid HTTP(S) article link up to 1000 characters, preserving raw query parameters. Invalid/missing links are omitted without blocking sends; do not invent app schemes or force phone click settings.
+
+Use official HTML `copy` controls beside the purchase CTA for the full cleaned product name and valid original link. Escape attributes and preserve model/specifications and link parameters. Keep an ordinary hyperlink; browser previews emulate clipboard actions separately from native WXPusher support. The WXPusher review and preview are in `analysis/wxpusher-review-2026-10-11.md` and `analysis/notification-preview-2026-10-11.html`.
+
 Label rebates `含返E卡`/`含返积分`; add `折算` only when original wording explicitly gives a price after rebate. Do not assume `119.9元（返240积分）` already subtracts the points. Preserve starting-price, range, unit-price, and complex-rebate semantics, and retain original price text so payment and rebate can be checked separately.
 
 HTML details lead with actual same-article worthy/collection growth, the fetched rank window/position, or a reduction from this project's historical pushed price; fall back to current worthy/comment counts. Historical pushed price is not market/all-time-low evidence. Without a historical price-drop note, the summary says `价差未核实` and details say price advantage needs checking. Prior-push comparisons may also have different purchase conditions.
@@ -116,6 +120,8 @@ Filter, comment, trend, and send logs include article ID/source. Record comment 
 Requests use 8/20-second connect/read timeouts and two GET retries for transient 500-series responses. Three consecutive main-page failures stop the scan. External requests are randomly throttled; WAF/captcha responses or two consecutive comment/late-detail failures suspend external checks for the rest of that run. Late-detail failures do not stop main-feed discovery and recover on the next scheduled run.
 
 GET retries set `respect_retry_after_header=False`; do not let a 429 Retry-After header hold the run outside its bounded window before the circuit breaker can inspect it. WXPusher POST is not immediately retried. A timeout has unknown outcome and does not enter success history; a later scan may reevaluate it, so duplicate delivery is still possible.
+
+Do not add send-status polling: the documented query endpoint returned disabled in a 2026-10-11 read-only check. This does not mean the original message failed; accepted tasks still do not prove terminal arrival.
 
 `.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, unit tests before scanning, and `actions/cache` for SQLite.
 

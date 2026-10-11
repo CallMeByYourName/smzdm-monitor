@@ -15,6 +15,7 @@ import json
 import hashlib
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -3396,15 +3397,20 @@ class SmzdmScraper:
 
         try:
             content = self._build_notification_content(data)
+            payload = {
+                "appToken": APP_TOKEN,
+                "content": content,
+                "summary": self._build_notification_summary(data),
+                "contentType": 2,
+                "uids": [UID],
+            }
+            original_url = self._notification_original_url(data.get('link'))
+            if original_url:
+                # JSON 使用原始 URL；HTML 的 &amp; 转义不能用于原文链接字段。
+                payload['url'] = original_url
             response = requests.post(
                 'https://wxpusher.zjiecode.com/api/send/message',
-                json={
-                    "appToken": APP_TOKEN,
-                    "content": content,
-                    "summary": self._build_notification_summary(data),
-                    "contentType": 2,
-                    "uids": [UID]
-                },
+                json=payload,
                 timeout=10
             )
             if response.status_code != 200:
@@ -3587,19 +3593,30 @@ class SmzdmScraper:
         conditions = self._notification_purchase_conditions(data)
         compact_conditions = {
             '含返E卡': '返E卡', '含返积分': '返积分', '国补条件': '国补',
-            '需用券': '用券', '随机免单活动': '随机免单', '晒单/评论奖励': '评论奖励',
+            'PLUS会员': 'PLUS', '需用券': '券',
+            '随机免单活动': '随机免单', '晒单/评论奖励': '评论奖励',
         }
-        condition_text = '/'.join(compact_conditions.get(value, value) for value in conditions)
+
+        def compact_condition(value):
+            compact = compact_conditions.get(value, value.replace('需买', '需'))
+            if value.startswith('需买') and len(compact) > 12:
+                return '数量见原文'
+            return compact
+
+        condition_text = '/'.join(compact_condition(value) for value in conditions)
         reason = self._notification_reasons(data)[0]
         reason = re.sub(r'较历史(?:同 SKU|相似商品)推送低', '较此前推送低', reason)
         for original, short in (
             ('分钟内新增', '分钟增'), ('个值票', '值'), ('个收藏', '藏'), ('条评论', '评'),
         ):
             reason = reason.replace(original, short)
-        if not data.get('price_drop_note'):
-            reason += '；价差未核实'
-        reason = reason[:36]
+        price_note = '；价差未核实' if not data.get('price_drop_note') else ''
         prefix = '｜'.join(part for part in (price, condition_text) if part)
+        if len(prefix) > 100 - 8 - 2 - len(price_note):
+            # 极端复杂价格仍在详情保留原文，摘要不能截掉商品及未核价提示。
+            prefix = '｜'.join(part for part in ('复杂价格见详情', condition_text) if part)
+        reason_budget = max(0, min(36 - len(price_note), 100 - len(prefix) - 8 - 2 - len(price_note)))
+        reason = reason[:reason_budget] + price_note
         title_budget = max(8, min(24, 100 - len(prefix) - len(reason) - 2))
         title = self._notification_short_title(data)
         if len(title) > title_budget:
@@ -3607,12 +3624,26 @@ class SmzdmScraper:
         return f'{prefix}｜{title}｜{reason}'[:100]
 
     @staticmethod
+    def _notification_original_url(value):
+        """原文入口仅复用可用的 HTTP(S) 链接，不猜第三方 App Scheme。"""
+        if not isinstance(value, str):
+            return ''
+        text = value.strip()
+        if len(text) > 1000 or re.search(r'[\s\\<>"\x27\x00-\x1f\x7f]', text):
+            return ''
+        try:
+            parts = urlsplit(text)
+            if (parts.scheme.lower() not in ('http', 'https') or not parts.hostname
+                    or parts.username is not None or parts.password is not None):
+                return ''
+            parts.port  # 非法端口同样不是可用 URL。
+        except ValueError:
+            return ''
+        return text
+
+    @staticmethod
     def _notification_safe_url(value):
-        # HTML escaping alone cannot make a javascript: URL safe.
-        text = str(value or '').strip()
-        if re.match(r'^https?://[^\s<>"\']+$', text, re.IGNORECASE):
-            return html.escape(text, quote=True)
-        return ''
+        return html.escape(SmzdmScraper._notification_original_url(value), quote=True)
 
     def _build_notification_content(self, data):
         """购物决策信息在前，内部筛选诊断在后。"""
@@ -3654,6 +3685,17 @@ class SmzdmScraper:
             f'<div style="margin:16px 0;"><a href="{link}" '
             'style="font-size:17px;font-weight:bold;">查看好价与购买方法 →</a></div>'
         ) if link else '<div style="margin:16px 0;">购买链接暂不可用</div>'
+        copy_style = 'display:inline-block;border:1px solid #888;border-radius:6px;padding:4px 10px;margin-right:8px;'
+        copy_buttons = []
+        if self._notification_plain_text(data.get('title')):
+            copy_buttons.append(
+                f'<copy style="{copy_style}" data-clipboard-text="{title}">复制商品名</copy>'
+            )
+        if link:
+            copy_buttons.append(
+                f'<copy style="{copy_style}" data-clipboard-text="{link}">复制原文链接</copy>'
+            )
+        copy_line = '<div style="margin-bottom:16px;">' + ' '.join(copy_buttons) + '</div>' if copy_buttons else ''
         coverage = data.get('comment_module_coverage') or {}
         diagnostics = [
             f"互动分 {metrics['composite_score']} · 路径 {data.get('quality_path', '综合筛选')}"
@@ -3696,6 +3738,7 @@ class SmzdmScraper:
           <div style="margin-top:12px;">{escape(vote_line)}<br>
           {int(data.get('comments', 0))} 条评论 · {int(data.get('collection', 0))} 个收藏</div>
           {link_line}
+          {copy_line}
           <hr style="border:none;border-top:1px solid #ddd;margin:14px 0;">
           <div style="font-size:12px;color:#888;">筛选记录<br>{diagnostic_lines}</div>
         </div>
