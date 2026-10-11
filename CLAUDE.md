@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-10`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-11`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
 ## Project
 
@@ -69,17 +69,23 @@ Snapshots with worthy >= 4 plus collection >= 4, worthy >= 6, or comments >= 8 c
 
 ## Comments
 
-Comment samples use `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`. This is normally a hot/related module, not full pagination. Author comments are excluded, and the module total may upgrade the list comment count.
+Comment samples use `https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}`. This is normally a hot/related module, not full pagination. Read actual `hot_comments_b.rows` and `child_list`, deduplicate comment IDs, and exclude parent-reference objects and `aigc_comment_rows` mirrors. Retain missing grades as unknown rather than dropping those comments. Identify accounts by stable `user_smzdm_id`, never by nickname; missing identities remain separated by comment ID. Author comments are excluded using both row flags and module author IDs, and the module total may upgrade the list comment count.
 
-Hard level/concentration decisions require a representative module response: about 80% coverage or no more than two missing comments.
+Hard level/concentration decisions require a representative module response: about 80% coverage or no more than two missing comments. Module coverage counts all deduplicated comments, including authors and missing grades; grade coverage separately uses non-author samples.
 
-- Lv5 and below is low level; Lv6 and above is high level.
-- Reject a representative sample when low-level ratio exceeds 35%.
+- Lv5 and below and Lv6 and above are grade features, not proof of fake/real accounts, purchases, or product quality.
+- Grade-ratio rejection additionally requires at least six known-level non-author samples and known grades covering at least 80% of non-author samples; reject only then when the low-level ratio exceeds 35%.
+- Three to five known levels or poor grade coverage remains diagnostic, with status `skipped` rather than `passed`.
 - With at least four samples, reject fewer than three users or one user above 50%.
+- Concentration checks are independent of the six-grade floor and run before large-thread partial allowances, including when author comments dominate the module. A narrow two-user mature-deal allowance keeps an insufficient-evidence grade status.
 - Undercovered or unavailable data does not block a deal by default.
 - The dynamic external-check budget covers all normally eligible candidates up to 80 per run.
 
 `pending_reviews` remains for compatibility, but unavailable-comment deferral is disabled.
+
+Reuse these already fetched samples for shadow comment-anomaly observations, without new requests: at least six non-author samples, identical normalized long text of at least 24 characters, at least four distinct stable user IDs in its group, and at least 60% sample share. Remove explicit quoted blocks; retain numbers/punctuation and do not treat short generic praise as evidence. Add a combined timing signal only when every repeated-group comment has interpretable time bounds and the group's widest possible interval spans no more than 180 seconds. Minute/hour relative timestamps retain minute/hour uncertainty, so hourly wording cannot imply a second-level burst.
+
+Log only aggregate counts, coverage, flags, interval upper bounds, and a short text hash. Do not store or log raw comment text or user IDs. These new signals are diagnostic, not hard rejection or proof of shills. The older worthy/unworthy and comment/worthy imbalance checks also observe only; separate growth/staleness filtering is unchanged.
 
 ## JD and Deduplication
 
@@ -88,6 +94,10 @@ JD self-operated hard filtering is disabled (`jd_self_filter_enabled = False`) b
 Only sends accepted for the target UID are recorded: require WXPusher outer `success`/`code` and target UID `code=1000`, and save `send_record_id`. This confirms an accepted asynchronous task, not terminal arrival or reading. Dedup uses article ID, platform product key when available, and normalized title fingerprint. Fingerprints remain active for 30 days. A matching SKU or fingerprint can be pushed again when the parsed price drops by at least RMB 5 or 5% from the previous minimum.
 
 Price comparison excludes rebates, coupon thresholds/face values, gifts, and original prices. Startup recalculates stored history price values to correct legacy rebate amounts mistaken for sale prices.
+
+An explicit WXPusher user keyword rejection starts a separate 45-minute cooldown only after validating the outer success/code, unique target UID, target `code=1001`, and the observed phrase `因为用户设置的关键字过滤，不发送`. Store SHA-256 of UID plus article ID in `push_keyword_cooldowns`, never a complete UID or successful history entry. Main/rank snapshots continue, while candidate enrichment/comments/sending skip that article. Late-detail SQL excludes cooling rows before its limit and fills the existing bounded budget with eligible alternatives. Expiry permits reevaluation and cleanup removes old state; the rule never becomes a global category, keyword, or SKU blacklist.
+
+Keyword rejection logs a sanitized INFO audit and independent count, not an operational send failure. Other failures, unverified/malformed results, and POST timeouts do not create cooldowns.
 
 ## Notifications and Diagnostics
 
@@ -99,7 +109,7 @@ HTML details lead with actual same-article worthy/collection growth, the fetched
 
 Display `score_rate` as `值票支持率` (worthy/(worthy+unworthy)), with concrete vote counts. It is not buyer product-review approval. After the purchase link, show concise diagnostics: quality path, composite score, observation/growth scores, comment coverage, and unavailable-level notes. Full user levels/concentration and trend baselines remain in audit logs. Escape external HTML text.
 
-Filter, comment, trend, and send logs include article ID/source. Record comment coverage and trend baseline article/time, and summarize send failures separately from Actions status. Keep app tokens and full recipient identifiers out of logs.
+Filter, comment, trend, and send logs include article ID/source. Record comment coverage and trend baseline article/time; summarize operational send failures, unknown POST outcomes, user keyword rejections, cooldown skips, and shadow observations separately from Actions status. Keep app tokens and full recipient identifiers out of logs.
 
 ## Stability and Deployment
 
@@ -111,7 +121,9 @@ GET retries set `respect_retry_after_header=False`; do not let a 429 Retry-After
 
 Keep the 15-minute cadence based on the 2026-10-10 review: recent runs averaged about four minutes, 72/100 reached the row cap, and early signals benefit from timely repeat observations. Hosted-runner startup failures recover on the next scheduled run; do not add immediate redispatches without new evidence. See `analysis/smzdm-review-2026-10-10.md` for the dated pre-fix review.
 
-Manual runs accept optional `debug_article_id`; the workflow prints that article's cached candidate snapshots and matching successful-push history before scanning. Use it to investigate missing items from real stored metrics.
+See `analysis/smzdm-api-research-2026-10-11.md` for the current comment/API research. Earlier dated reports and rule proposals remain historical evidence. The six interaction paths and growth thresholds are unchanged by this update.
+
+Manual runs accept optional `debug_article_id`; the workflow initializes/migrates the restored database before printing that article's candidate snapshots, matching successful-push history, and late-recheck queue position. Queue diagnostics use the configured UID so recipient cooldown exclusions match the scan. Use it to investigate missing items from real stored metrics.
 
 `actions/cache` is not transactional state. Closely spaced or retried runs may restore an older database, so the current system cannot promise exactly-once notifications.
 

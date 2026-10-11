@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-10`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
+This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-11`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
 ## Project Overview
 
@@ -36,6 +36,7 @@ The script performs one scan, sends any accepted deals, and exits. Scheduling be
 - `smzdm.py`: application code, configuration, SQLite schema, filtering, network access, and notification formatting.
 - `test_smzdm.py`: unit tests for feed handling, title filters, quality paths, trends, comments, deduplication, and push logs.
 - `test_trends_titles.py`, `test_notification_format.py`, `test_push_delivery.py`: focused tests for article isolation/title protection, notification display, and recipient delivery-result handling.
+- `test_push_keyword_cooldown.py`, `test_comment_evidence.py`, `test_comment_anomalies.py`: focused tests for recipient keyword cooldowns, independent grade evidence/concentration gates, and comment parsing/anomaly observations.
 - `.github/workflows/smzdm.yml`: GitHub Actions runner and SQLite cache handling.
 - `README.md`: current user-facing behavior and deployment documentation.
 - `analysis/`: dated historical log reviews. A dated report is evidence from that point in time, not current configuration.
@@ -102,18 +103,28 @@ Comment samples come from:
 https://haojia.m.smzdm.com/detail_modul/user_related_modul?article_id={article_id}
 ```
 
-This module usually exposes hot/related samples, not the complete comment pagination. The scraper excludes author comments using both `display_author` and module `author_smzdm_id`, records declared totals and sample counts, and may upgrade the list comment count when the module declares a larger total.
+This module usually exposes hot/related samples, not the complete comment pagination. Read only `data.comments.hot_comments_b.rows` and actual `child_list` descendants, deduplicate by comment ID, and ignore parent-reference objects and `aigc_comment_rows` mirrors. Keep comments without `vip_level` as unknown-level samples; otherwise module and grade coverage become overstated. Use stable `user_smzdm_id`, never nicknames as account identity; isolate missing identities by comment ID instead of treating them as a single unknown account. The scraper excludes author comments using both `display_author` and module `author_smzdm_id`, records declared totals and sample counts, and may upgrade the list comment count when the module declares a larger total.
 
-Level and concentration checks only become hard filters when the returned sample is representative: roughly 80% coverage or within two comments of the expected total.
+Level and concentration checks only become hard filters when the returned sample is representative: roughly 80% coverage or within two comments of the expected total. Module coverage counts all deduplicated returned comments, including authors and unknown levels; grade evidence is computed independently after authors are removed.
 
-- Lv5 and below is low level; Lv6 and above is high level.
-- Low-level ratio above 35% is rejected.
+- Lv5 and below is a low-level feature; Lv6 and above is a high-level feature. Neither proves fake-account identity, real purchase, or product quality.
+- Grade-ratio hard rejection requires at least six known-level non-author samples and known levels covering at least 80% of all non-author samples. Only then is a low-level ratio above 35% rejected.
+- Three to five known-level samples, or insufficient known-level coverage, are diagnostic and reported as `skipped`, never `passed`.
 - With at least four samples, fewer than three unique users or one user above 50% is rejected.
-- A representative two-user high-level sample has a narrow mature-deal pass defined by `CONFIG`.
+- Concentration checks remain independent of the six-known-level floor and run before large-thread partial-sample allowances, so author-heavy modules cannot bypass the four-sample checks.
+- A representative two-user high-level sample has a narrow mature-deal allowance defined by `CONFIG`; its grade status still indicates insufficient evidence.
 - Undercovered, missing, WAF-blocked, or budget-unavailable samples are diagnostic and do not block an interaction/trend-qualified deal by default.
 - The dynamic budget checks all normally eligible candidates up to 80 external comment requests per run.
 
 Legacy `pending_reviews` state remains for database compatibility, but unavailable-comment deferral is disabled.
+
+## Anomaly Observations
+
+Reuse already fetched non-author comments; do not add external requests. The new comment detector is shadow-only: at least six samples, the same normalized long text of at least 24 characters, at least four distinct stable user IDs in that group, and that group covering at least 60% of samples produce a repeated-text observation. Remove explicit blockquotes and normalize HTML/Unicode/whitespace while retaining numbers and punctuation; short generic praise does not qualify.
+
+A combined duplicate-text burst additionally requires every comment in that repeated group to have interpretable time bounds and the group's widest possible interval span to be at most 180 seconds. Relative minute/hour timestamps are intervals of that precision; hourly timestamps must not produce a false second-level burst. Missing timing cannot supply burst evidence.
+
+Log aggregate sample/user counts, coverage, interval upper bounds, flags, and a short text hash only. Do not persist or log raw comment text or account IDs. These observations do not reject candidates or assert that shills are confirmed. Existing worthy/unworthy and comment/worthy imbalance checks are also diagnostic only; the separate snapshot growth/staleness filters retain their behavior.
 
 ## JD Handling
 
@@ -128,6 +139,14 @@ Old JD lookup helpers remain behind the disabled flag. Do not enable hard reject
 - Fingerprints remain active for 30 days. Price text is normalized before fingerprinting.
 - The same SKU or fingerprint may be pushed again when the parsed price is at least RMB 5 lower or at least 5% lower than the historical minimum.
 - Successful push logs include article ID, source, quality path, parsed price, score rate, engagement counts, target status, and send record ID so Actions runs can be audited precisely.
+
+## Recipient Keyword Cooldown
+
+Only a valid WXPusher outer success/code plus a unique matching target UID with `code=1001` and the observed explicit status `因为用户设置的关键字过滤，不发送` starts a 45-minute cooldown. Store it in `push_keyword_cooldowns`, keyed by SHA-256 of the UID plus article ID; never persist the complete UID, mark the item delivered, or insert it into `history`.
+
+Main/rank discovery continues saving snapshots during cooldown, then skips candidate enrichment, comment checks, and sending for that article. Late-detail selection excludes active cooldowns in SQL before the selection limit and fills the bounded budget with other eligible candidates. Expiry permits normal reevaluation after user keyword changes; cleanup removes expired state. This is per recipient/article, not a global category, keyword, or SKU blacklist.
+
+Explicit user keyword rejection is an INFO audit event with sanitized recipient status/code/send record ID and its own counter, separate from operational push failures. Other rejections, transport failures, malformed/unverified results, and unknown POST outcomes never start this cooldown.
 
 ## Notification Contract
 
@@ -153,7 +172,7 @@ Price comparison excludes rebates, coupon thresholds/face values, gifts, and ori
 - Late-detail traffic scales at 4% of the eligible backlog with a 4-request floor and 16-request hard cap. It is tracked independently in `late_recheck_state`; failure is diagnostic and does not stop main-feed discovery.
 - WXPusher POST is not retried immediately. A timeout is an unknown outcome, is counted separately in send diagnostics, and must not be reported as a confirmed rejection or terminal success. Failed or unknown sends do not enter `history`; a future scan may reevaluate them, so duplicate delivery remains possible.
 
-Filter, comment, trend, and send diagnostics should include article ID and source. Log comment coverage and trend baseline article/time, and include send-failure totals in the run summary. Avoid logging app tokens or full recipient identifiers.
+Filter, comment, trend, and send diagnostics should include article ID and source. Log comment coverage and trend baseline article/time; separate operational send failures, unknown POST outcomes, explicit keyword rejections, cooldown skips, and shadow observations in the run summary. Avoid logging app tokens or full recipient identifiers.
 
 Keep the external request count bounded. New sources should first reuse existing JSON endpoints, have strict timeouts, and degrade without blocking the full scan.
 
@@ -163,7 +182,9 @@ Keep the external request count bounded. New sources should first reuse existing
 
 The 2026-10-10 review supports keeping this cadence: recent runs averaged about four minutes, 72/100 reached the 5100-row cap, and early paths need timely repeat observations. Do not add immediate recovery dispatches for hosted-runner startup failures; the next scheduled run recovers without extra duplicate traffic. Revisit cadence with new latency, coverage, or rate-limit evidence.
 
-Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID and prints matching `candidate_snapshots` plus successful-push history for the same ID, SKU, or fingerprint before the scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
+The 2026-10-11 comment/API review is recorded in `analysis/smzdm-api-research-2026-10-11.md`. Earlier dated reports, including the rule proposal, remain historical evidence rather than current configuration. The six interaction paths and trend thresholds remain unchanged by the comment/cooldown changes.
+
+Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID, initializes/migrates the restored database before diagnostic SQL, and prints matching `candidate_snapshots` plus successful-push history for the same ID, SKU, or fingerprint before the scan. Queue diagnostics use the configured UID so recipient cooldown exclusions match the actual scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
 
 The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, unit tests before scanning, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
 

@@ -157,19 +157,22 @@ class SmzdmFilterTests(unittest.TestCase):
         self.addCleanup(scraper._cleanup)
         data = {
             "id": "111", "title": "测试商品", "late_recheck_source": True,
-            "comments": 4, "worthy": 6, "unworthy": 0, "collection": 8,
+            "comments": 7, "worthy": 6, "unworthy": 0, "collection": 8,
         }
         samples = [
             {"user_id": "u1", "level": 3},
             {"user_id": "u2", "level": 4},
             {"user_id": "u3", "level": 8},
+            {"user_id": "u4", "level": 3},
+            {"user_id": "u5", "level": 8},
+            {"user_id": "u6", "level": 8},
         ]
-        meta = {"module_total": 4, "all_count": 4, "author_count": 1}
+        meta = {"module_total": 7, "all_count": 7, "author_count": 1}
         with patch.object(scraper, "_fetch_comment_samples", return_value=(samples, meta)):
             with self.assertLogs(level="WARNING") as logs:
                 self.assertFalse(scraper._check_comment_user_levels(data))
         message = "\n".join(logs.output)
-        for field in ("id:111", "来源:延迟详情", "返回:4/4", "覆盖率:100%", "作者排除:1"):
+        for field in ("id:111", "来源:延迟详情", "返回:7/7", "覆盖率:100%", "作者排除:1", "等级已知:6/6"):
             self.assertIn(field, message)
 
     def test_undercovered_low_level_samples_remain_diagnostic(self):
@@ -205,7 +208,7 @@ class SmzdmFilterTests(unittest.TestCase):
             "unworthy": 1,
         }
 
-        with self.assertLogs(level="INFO") as logs:
+        with patch.object(self.scraper, '_is_push_keyword_cooling_down', return_value=False), self.assertLogs(level="INFO") as logs:
             self.assertTrue(self.scraper._send_notification(data))
 
         message = "\n".join(logs.output)
@@ -297,6 +300,11 @@ class SmzdmFilterTests(unittest.TestCase):
     def test_late_recheck_selection_respects_interval_and_discovery(self):
         self.scraper.conn = sqlite3.connect(":memory:")
         self.scraper.conn.execute("CREATE TABLE history (id TEXT PRIMARY KEY)")
+        self.scraper.conn.execute(
+            '''CREATE TABLE push_keyword_cooldowns (
+                recipient_key TEXT, article_id TEXT, expires_at TEXT
+            )'''
+        )
         self.scraper.conn.execute(
             """
             CREATE TABLE candidate_snapshots (

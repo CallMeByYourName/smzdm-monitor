@@ -13,6 +13,7 @@ import re
 import html
 import json
 import hashlib
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -50,12 +51,13 @@ CONFIG = {
     "detail_api_version": "10.4.26",
     "detail_api_revision": "866",
     "max_consecutive_detail_failures": 2,
+    "push_keyword_cooldown_minutes": 45,  # 仅接收人明确的关键词过滤拒绝进入短期冷却
 
     # 第一阶段：综合评分筛选
     "score_weights": {
-        "comments": 3,                  # 评论权重最高（最难刷）
+        "comments": 3,                  # 评论体现讨论热度，不能证明最难刷或已购买
         "collection": 2,                # 收藏权重中等
-        "worthy": 1,                    # 值权重最低（最易刷）
+        "worthy": 1,                    # 值票是社区支持信号，不等于实际购买
     },
     "min_total_engagement": 25,         # 均衡路径需要成熟、分布较完整的互动
     "min_composite_score": 65,
@@ -126,12 +128,14 @@ CONFIG = {
         "京东超市",
     ],
 
-    # 第三阶段：评论用户等级水军检测（haojia.m.smzdm.com 真实 JSON 的 vip_level）
+    # 第三阶段：评论等级特征与集中度检查（haojia.m.smzdm.com 真实 JSON 的 vip_level）
     "comment_level_check_enabled": True,
-    "comment_level_low_max": 5,          # Lv5 及以下视为低等级/新号
-    "comment_level_high_min": 6,         # Lv6 及以上视为真实用户倾向
-    "comment_level_min_comments": 3,     # 可取到的评论数少于此值时不做等级判断
-    "comment_level_max_low_ratio": 0.35, # 低等级评论用户占比超过 35% 则过滤
+    "comment_level_low_max": 5,          # Lv5 及以下为低等级特征，不等于虚假账号
+    "comment_level_high_min": 6,         # Lv6 及以上为高等级特征，不等于真实购买认证
+    "comment_level_min_comments": 3,     # 列表达到此值才请求样本，独立于等级否决证据门槛
+    "comment_level_min_known_samples": 6, # 等级比例硬拒前至少有 6 条已知等级的非作者样本
+    "comment_level_min_known_ratio": 0.8, # 已知等级至少覆盖 80% 非作者样本
+    "comment_level_max_low_ratio": 0.35, # 证据充足时，低等级占已知等级超过 35% 则过滤
     "comment_concentration_min_comments": 4,  # 评论样本达到此数量才检查集中度
     "comment_concentration_min_users": 3,     # 独立评论用户过少则可疑
     "comment_concentration_max_user_ratio": 0.5, # 单个用户评论占比过高则可疑
@@ -166,12 +170,19 @@ CONFIG = {
     "budget_strong_pass_min_score": 120,
     "budget_strong_pass_min_comments": 20,
 
-    # 第四阶段：水军检测兜底（基于异常分析，需同时满足多项）
+    # 第四阶段：互动比例异常观察，不能仅靠缺少不值票/评论认定水军
     "shill_detection_enabled": True,
     "shill_min_votes_for_check": 30,        # 总投票数少于此值时跳过水军检测
     "shill_max_worthy_unworthy_ratio": 20,  # 值/不值比超过此值则可疑指标+1
     "shill_min_comment_worthy_ratio": 0.2,  # 评论数/值票数低于此值则可疑指标+1
-    "shill_min_flags": 2,                   # 至少N个可疑指标才标记为水军
+    "shill_min_flags": 2,                   # 至少两个比例异常才记录，仍不是账号身份判断
+    # 复用已有评论请求的正文和时间；未经标注校准，只观察，不新增硬拒绝。
+    "comment_anomaly_enabled": True,
+    "comment_anomaly_min_samples": 6,
+    "comment_anomaly_min_text_length": 24,
+    "comment_anomaly_min_duplicate_users": 4,
+    "comment_anomaly_min_duplicate_ratio": 0.6,
+    "comment_anomaly_burst_seconds": 180,
     "trend_stale_filter_enabled": True,      # 初始有票但多轮不增长时降噪
     "trend_stale_min_age_minutes": 60,
     "trend_stale_max_growth_score": 3,
@@ -333,6 +344,8 @@ class SmzdmScraper:
             'total_sent': 0,
             'total_push_failed': 0,
             'total_push_unknown': 0,
+            'total_push_keyword_filtered': 0,
+            'total_push_keyword_cooldown_skipped': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
             'total_product_key_duplicates': 0,
@@ -360,6 +373,10 @@ class SmzdmScraper:
             'total_comment_level_fallback_allowed': 0,
             'total_comment_level_large_thread_allowed': 0,
             'total_comment_level_undercovered_skipped': 0,
+            'total_comment_level_insufficient_evidence': 0,
+            'total_comment_anomaly_observed': 0,
+            'total_comment_anomaly_combined': 0,
+            'total_engagement_anomaly_observed': 0,
             'total_comment_level_budget_strong_allowed': 0,
             'total_external_checks_suspended': 0,
         }
@@ -477,6 +494,18 @@ class SmzdmScraper:
                 retired INTEGER DEFAULT 0
             )
         ''')
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS push_keyword_cooldowns (
+                recipient_key TEXT NOT NULL,
+                article_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (recipient_key, article_id)
+            )
+        ''')
+        self.conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_push_keyword_cooldowns_expiry '
+            'ON push_keyword_cooldowns (expires_at)'
+        )
         self.conn.commit()
 
     def _ensure_history_columns(self):
@@ -574,6 +603,8 @@ class SmzdmScraper:
 
         # 第二轮：可选京东自营、评论等级、互动异常检测
         for parsed in candidates:
+            if self._skip_push_keyword_cooldown(parsed):
+                continue
             if CONFIG['jd_self_filter_enabled'] and not self._check_jd_self_operated(parsed):
                 self.stats['total_filtered_jd_self'] += 1
                 continue
@@ -740,6 +771,9 @@ class SmzdmScraper:
 
         self._attach_trend_metrics(parsed)
         self._save_candidate_snapshot(parsed)
+        # 保留列表观察，短期避免再次为接收人已明确屏蔽的同一文章请求评论或发送。
+        if self._skip_push_keyword_cooldown(parsed):
+            return
 
         if not self._filter_stage1(parsed):
             self.stats['total_filtered_stage1'] += 1
@@ -903,7 +937,11 @@ class SmzdmScraper:
             LEFT JOIN history ON history.id = snapshots.article_id
             LEFT JOIN late_recheck_state AS recheck
               ON recheck.article_id = snapshots.article_id
+            LEFT JOIN push_keyword_cooldowns AS cooldown
+              ON cooldown.article_id = snapshots.article_id
+             AND cooldown.recipient_key = ? AND cooldown.expires_at > ?
             WHERE history.id IS NULL
+              AND cooldown.article_id IS NULL
               AND snapshots.captured_at <= ?
               AND COALESCE(recheck.retired, 0) = 0
               AND (recheck.last_checked IS NULL OR recheck.last_checked <= ?)
@@ -926,6 +964,8 @@ class SmzdmScraper:
             LIMIT ?
             ''',
             (
+                self._push_recipient_key(),
+                datetime.utcnow().isoformat(timespec='seconds'),
                 cutoff.isoformat(timespec='seconds'),
                 cutoff.isoformat(timespec='seconds'),
                 CONFIG['late_recheck_min_worthy'],
@@ -2474,7 +2514,7 @@ class SmzdmScraper:
         return None
 
     def _check_comment_user_levels(self, parsed):
-        """根据评论 JSON 中的 vip_level 识别低等级账号占比。"""
+        """代表性样本中，仅在等级证据充足时用 vip_level 比例拒绝。"""
         audit = self._candidate_log_context(parsed)
         if self.external_checks_suspended:
             self._mark_comment_level_unavailable(parsed, 'external')
@@ -2515,6 +2555,7 @@ class SmzdmScraper:
         coverage = self._build_comment_module_coverage(parsed, comment_meta)
         parsed['comment_module_coverage'] = coverage
         self._upgrade_comment_count_from_module(parsed, coverage)
+        self._observe_comment_anomalies(parsed, samples, coverage)
         audit += (
             f" 列表:{coverage['list_count']} 模块声明:{coverage['module_total']} "
             f"返回:{coverage['returned']}/{coverage['expected']} "
@@ -2555,17 +2596,39 @@ class SmzdmScraper:
         if samples:
             parsed['comment_level_stats'] = level_stats
 
+        # 作者回复可能占满整个模块，但不应让少数非作者反复评论绕过集中度检查。
+        # 两条独立高等级样本的成熟候选例外仍在下方处理；集中度只从四条起检查。
+        if (len(samples) >= CONFIG['comment_concentration_min_comments']
+                and level_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
+            parsed['comment_level_status'] = 'rejected'
+            parsed['comment_level_note'] = '代表性样本中独立评论用户不足'
+            logging.warning(
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
+                f"独立用户:{level_stats['unique_users']}/{len(samples)}"
+            )
+            return False
+
+        if (len(samples) >= CONFIG['comment_concentration_min_comments']
+                and level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
+            parsed['comment_level_status'] = 'rejected'
+            parsed['comment_level_note'] = '代表性样本中单用户评论过于集中'
+            logging.warning(
+                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
+                f"最高单用户:{level_stats['max_user_comments']}/{len(samples)}={level_stats['max_user_ratio']:.0%}"
+            )
+            return False
+
         if len(samples) < CONFIG['comment_level_min_comments']:
             if parsed.get('comments', 0) >= CONFIG['comment_level_min_comments']:
                 if self._is_large_thread_partial_pass(parsed, samples, level_stats, comment_meta):
                     self.stats['total_comment_level_large_thread_allowed'] += 1
-                    parsed['comment_level_status'] = 'passed'
+                    parsed['comment_level_status'] = 'skipped'
                     parsed['comment_level_note'] = (
-                        f"大评论区少样本通过（模块评论{comment_meta.get('module_total', 0)}）"
+                        f"大评论区少样本放行，等级证据不足（模块评论{comment_meta.get('module_total', 0)}）"
                     )
                     parsed.pop('comment_level_unavailable_reason', None)
                     logging.info(
-                        f"[评论大区少样本通过] {parsed['title'][:40]}... | {audit} "
+                        f"[评论大区少样本放行，等级证据不足] {parsed['title'][:40]}... | {audit} "
                         f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
                         f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
                         f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
@@ -2576,11 +2639,11 @@ class SmzdmScraper:
                     return True
 
                 if self._is_partial_sample_pass(parsed, samples, level_stats):
-                    parsed['comment_level_status'] = 'passed'
-                    parsed['comment_level_note'] = '少样本通过'
+                    parsed['comment_level_status'] = 'skipped'
+                    parsed['comment_level_note'] = '少样本放行，等级证据不足'
                     parsed.pop('comment_level_unavailable_reason', None)
                     logging.info(
-                        f"[评论等级少样本通过] {parsed['title'][:40]}... | {audit} "
+                        f"[评论少样本放行，等级证据不足] {parsed['title'][:40]}... | {audit} "
                         f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)}="
                         f"{level_stats['low_ratio']:.0%}, "
                         f"Lv>={CONFIG['comment_level_high_min']} {level_stats['high']} | "
@@ -2604,13 +2667,13 @@ class SmzdmScraper:
         if self._is_large_thread_under_sampled(samples, comment_meta):
             if self._is_large_thread_partial_pass(parsed, samples, level_stats, comment_meta):
                 self.stats['total_comment_level_large_thread_allowed'] += 1
-                parsed['comment_level_status'] = 'passed'
+                parsed['comment_level_status'] = 'skipped'
                 parsed['comment_level_note'] = (
-                    f"大评论区少样本通过（模块评论{comment_meta.get('module_total', 0)}）"
+                    f"大评论区少样本放行，等级证据不足（模块评论{comment_meta.get('module_total', 0)}）"
                 )
                 parsed.pop('comment_level_unavailable_reason', None)
                 logging.info(
-                    f"[评论大区少样本通过] {parsed['title'][:40]}... | {audit} "
+                    f"[评论大区少样本放行，等级证据不足] {parsed['title'][:40]}... | {audit} "
                     f"模块评论:{comment_meta.get('module_total', 0)} 原始样本:{comment_meta.get('all_count', 0)} "
                     f"作者:{comment_meta.get('author_count', 0)} 非作者:{len(samples)} | "
                     f"Lv<={CONFIG['comment_level_low_max']} {level_stats['low']}/{len(samples)} "
@@ -2634,30 +2697,46 @@ class SmzdmScraper:
         low_count = level_stats['low']
         high_count = level_stats['high']
         low_ratio = level_stats['low_ratio']
+        grade_evidence_sufficient = (
+            level_stats['level_count'] >= CONFIG['comment_level_min_known_samples']
+            and level_stats['known_ratio'] >= CONFIG['comment_level_min_known_ratio']
+        )
+        audit += (
+            f" 等级已知:{level_stats['level_count']}/{len(samples)} "
+            f"等级覆盖率:{level_stats['known_ratio']:.0%}"
+        )
+        level_stats['evidence_sufficient'] = grade_evidence_sufficient
 
-        if low_ratio > CONFIG['comment_level_max_low_ratio']:
+        if grade_evidence_sufficient and low_ratio > CONFIG['comment_level_max_low_ratio']:
+            parsed['comment_level_status'] = 'rejected'
+            parsed['comment_level_note'] = '代表性样本中低等级占比超过门槛'
             logging.warning(
-                f"[评论等级水军过滤] {parsed['title'][:40]}... | {audit} "
+                f"[评论等级特征过滤] {parsed['title'][:40]}... | {audit} "
                 f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
                 f"Lv>={CONFIG['comment_level_high_min']} {high_count}"
             )
             return False
 
-        if (len(samples) >= CONFIG['comment_concentration_min_comments']
-                and level_stats['unique_users'] < CONFIG['comment_concentration_min_users']):
-            logging.warning(
-                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
-                f"独立用户:{level_stats['unique_users']}/{len(samples)}"
+        if not grade_evidence_sufficient:
+            self.stats['total_comment_level_insufficient_evidence'] = (
+                self.stats.get('total_comment_level_insufficient_evidence', 0) + 1
             )
-            return False
-
-        if (len(samples) >= CONFIG['comment_concentration_min_comments']
-                and level_stats['max_user_ratio'] > CONFIG['comment_concentration_max_user_ratio']):
-            logging.warning(
-                f"[评论集中水军过滤] {parsed['title'][:40]}... | {audit} "
-                f"最高单用户:{level_stats['max_user_comments']}/{len(samples)}={level_stats['max_user_ratio']:.0%}"
+            parsed['comment_level_status'] = 'skipped'
+            parsed['comment_level_note'] = (
+                f"等级证据不足：等级已知{level_stats['level_count']}/{len(samples)}"
+                f"（{level_stats['known_ratio']:.0%}），需至少"
+                f"{CONFIG['comment_level_min_known_samples']}条且覆盖"
+                f"{CONFIG['comment_level_min_known_ratio']:.0%}；仅作诊断"
             )
-            return False
+            parsed.pop('comment_level_unavailable_reason', None)
+            logging.info(
+                f"[评论等级证据不足，仅作诊断] {parsed['title'][:40]}... | {audit} "
+                f"Lv<={CONFIG['comment_level_low_max']} {low_count}/{level_stats['level_count']}={low_ratio:.0%}, "
+                f"Lv>={CONFIG['comment_level_high_min']} {high_count} | "
+                f"独立用户:{level_stats['unique_users']}/{len(samples)} "
+                f"最高单用户:{level_stats['max_user_comments']}/{len(samples)}"
+            )
+            return True
 
         parsed['comment_level_status'] = 'passed'
         parsed.pop('comment_level_note', None)
@@ -2679,6 +2758,7 @@ class SmzdmScraper:
         return {
             'count': len(samples),
             'level_count': len(levels),
+            'known_ratio': len(levels) / len(samples) if samples else 0,
             'low': low_count,
             'high': high_count,
             'low_ratio': low_ratio,
@@ -2911,7 +2991,11 @@ class SmzdmScraper:
             return [], empty_meta
 
         all_samples = []
-        self._collect_comment_samples(resp_json, all_samples, include_author=True)
+        # 只读该文章实际展示的评论树。aigc_comment_rows 当前是镜像，
+        # comment_parent_id 还可能是父评论引用对象，不能当作新增用户发言。
+        hot_comments = self._comment_hot_module(resp_json)
+        rows = hot_comments.get('rows', [])
+        self._collect_comment_samples(rows, all_samples, include_author=True)
         all_samples = self._dedupe_comment_samples(all_samples)
         author_ids = self._extract_comment_author_ids(resp_json)
         samples = [
@@ -2923,34 +3007,52 @@ class SmzdmScraper:
 
     def _collect_comment_samples(self, node, samples, include_author=False):
         if isinstance(node, dict):
-            if 'comment_id' in node and 'vip_level' in node and (include_author or not node.get('display_author')):
-                user_id = str(node.get('user_smzdm_id') or node.get('display_name') or '').strip()
+            raw_id = node.get('comment_id')
+            valid_id = isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) and str(raw_id).strip() not in ('', '0')
+            is_comment = valid_id and ('content' in node or 'vip_level' in node)
+            is_author = node.get('display_author') in (True, 1, '1')
+            if is_comment and (include_author or not is_author):
+                user_id = str(node.get('user_smzdm_id') or '').strip()
+                identity_known = bool(user_id and user_id != '0')
                 level = None
                 try:
-                    level = int(node['vip_level'])
+                    raw_level = node.get('vip_level')
+                    if raw_level is not None and not isinstance(raw_level, bool):
+                        level = int(raw_level)
+                        if level < 0:
+                            level = None
                 except (TypeError, ValueError):
                     pass
                 samples.append({
                     'level': level,
-                    'user_id': user_id or f"comment:{node.get('comment_id')}",
+                    # 昵称不唯一；未知账号以评论 ID 分隔，不能合并为同一人。
+                    'user_id': user_id if identity_known else f"comment:{node.get('comment_id')}",
+                    'identity_known': identity_known,
                     'comment_id': str(node.get('comment_id', '')),
-                    'display_author': bool(node.get('display_author')),
+                    'display_author': is_author,
+                    'content': node.get('content') if isinstance(node.get('content'), str) else '',
+                    'creation_date': node.get('creation_date') if isinstance(node.get('creation_date'), str) else '',
                 })
-            for value in node.values():
+            # 只深入实际子评论，忽略引用对象和推荐/镜像分支。
+            children = [node.get('child_list', [])] if is_comment else node.values()
+            for value in children:
                 self._collect_comment_samples(value, samples, include_author=include_author)
         elif isinstance(node, list):
             for value in node:
                 self._collect_comment_samples(value, samples, include_author=include_author)
 
     @staticmethod
+    def _comment_hot_module(resp_json):
+        node = resp_json
+        for field in ('data', 'comments', 'hot_comments_b'):
+            if not isinstance(node, dict):
+                return {}
+            node = node.get(field)
+        return node if isinstance(node, dict) else {}
+
+    @staticmethod
     def _extract_comment_author_ids(resp_json):
-        hot_comments = {}
-        if isinstance(resp_json, dict):
-            hot_comments = (
-                resp_json.get('data', {})
-                .get('comments', {})
-                .get('hot_comments_b', {})
-            )
+        hot_comments = SmzdmScraper._comment_hot_module(resp_json)
         author_ids = set()
         if isinstance(hot_comments, dict):
             for field in ('author_smzdm_id', 'author_id'):
@@ -2969,13 +3071,7 @@ class SmzdmScraper:
 
     @staticmethod
     def _extract_comment_module_meta(resp_json, all_samples, samples, author_ids=None):
-        hot_comments = {}
-        if isinstance(resp_json, dict):
-            hot_comments = (
-                resp_json.get('data', {})
-                .get('comments', {})
-                .get('hot_comments_b', {})
-            )
+        hot_comments = SmzdmScraper._comment_hot_module(resp_json)
         rows = hot_comments.get('rows') if isinstance(hot_comments, dict) else []
         try:
             module_total = int(hot_comments.get('total') or 0)
@@ -3019,6 +3115,108 @@ class SmzdmScraper:
             deduped.append(sample)
         return deduped
 
+    @staticmethod
+    def _comment_time_bounds(value, observed_at):
+        """以区间保留相对时间精度，不把“12小时前”伪装成秒级时间。"""
+        value = str(value or '').strip()
+        if len(value) > 64:
+            return None
+        match = re.fullmatch(r'(\d+)\s*(秒|分钟|小时)前', value)
+        if match:
+            unit = {'秒': 1, '分钟': 60, '小时': 3600}[match.group(2)]
+            seconds = int(match.group(1)) * unit
+            if seconds > 366 * 24 * 3600 or observed_at - seconds - unit < 0:
+                return None
+            return observed_at - seconds - unit, observed_at - seconds
+        if value == '刚刚':
+            return observed_at - 60, observed_at
+        try:
+            # SMZDM 无时区的完整日期按北京时间解释。
+            stamp = datetime.strptime(value, '%Y-%m-%d %H:%M:%S').replace(
+                tzinfo=timezone(timedelta(hours=8))
+            ).timestamp()
+            if stamp > observed_at + 60:
+                return None
+            return stamp, stamp
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    @staticmethod
+    def _comment_normalized_text(value):
+        if not isinstance(value, str):
+            return ''
+        # 显式引用块不是评论者原创正文；保留数字及标点语义，不做模糊情感判断。
+        value = re.sub(r'<blockquote\b[^>]*>.*?</blockquote>', '', value, flags=re.I | re.S)
+        value = html.unescape(re.sub(r'<[^>]+>', '', value))
+        return re.sub(r'\s+', '', unicodedata.normalize('NFKC', value)).casefold()
+
+    def _observe_comment_anomalies(self, parsed, samples, coverage):
+        """复用非作者样本进行影子检测；记录聚合证据，不影响放行、不存正文/用户 ID。"""
+        if not CONFIG.get('comment_anomaly_enabled'):
+            return
+        samples = self._dedupe_comment_samples([
+            sample for sample in samples if not self._is_author_comment_sample(sample)
+        ])
+        groups = {}
+        known_users = set()
+        for sample in samples:
+            user_id = str(sample.get('user_id') or '')
+            known = sample.get('identity_known', bool(user_id and not user_id.startswith('comment:')))
+            if not known or not user_id or self._is_author_comment_sample(sample):
+                continue
+            known_users.add(user_id)
+            text = self._comment_normalized_text(sample.get('content'))
+            if len(text) >= CONFIG['comment_anomaly_min_text_length']:
+                groups.setdefault(text, []).append(sample)
+
+        observed_at = time.time()
+        evidence = {
+            'mode': 'observe', 'sample_count': len(samples),
+            'known_users': len(known_users), 'representative': bool(coverage.get('representative')),
+            'flags': [], 'duplicate_comments': 0, 'duplicate_users': 0,
+            'duplicate_ratio': 0, 'timed_users': 0, 'burst_span_seconds': None,
+        }
+        if len(samples) >= CONFIG['comment_anomaly_min_samples']:
+            for text, group in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True):
+                users = {sample['user_id'] for sample in group}
+                ratio = len(group) / len(samples)
+                if (len(users) < CONFIG['comment_anomaly_min_duplicate_users']
+                        or ratio < CONFIG['comment_anomaly_min_duplicate_ratio']):
+                    continue
+                evidence.update({
+                    'flags': ['repeated_long_text'], 'duplicate_comments': len(group),
+                    'duplicate_users': len(users), 'duplicate_ratio': round(ratio, 3),
+                    'text_hash': hashlib.sha256(text.encode('utf-8')).hexdigest()[:12],
+                })
+                bounds = [
+                    (sample['user_id'], self._comment_time_bounds(sample.get('creation_date'), observed_at))
+                    for sample in group
+                ]
+                bounds = [(user_id, span) for user_id, span in bounds if span is not None]
+                evidence['timed_users'] = len({user_id for user_id, _ in bounds})
+                # 要求重复组每条都能解释时间，且用整个时间区间的最宽跨度。
+                if len(bounds) == len(group):
+                    span = max(interval[1] for _, interval in bounds) - min(interval[0] for _, interval in bounds)
+                    evidence['burst_span_seconds'] = round(span)
+                    if span <= CONFIG['comment_anomaly_burst_seconds']:
+                        evidence['flags'].append('duplicate_text_burst')
+                break
+
+        parsed['comment_anomaly_stats'] = evidence
+        if evidence['flags']:
+            self.stats['total_comment_anomaly_observed'] = self.stats.get('total_comment_anomaly_observed', 0) + 1
+            if len(evidence['flags']) > 1:
+                self.stats['total_comment_anomaly_combined'] = self.stats.get('total_comment_anomaly_combined', 0) + 1
+            logging.info(
+                f"[评论异常观察] {self._candidate_log_context(parsed)} "
+                f"非作者:{len(samples)} 稳定账号:{len(known_users)} "
+                f"模块覆盖:{coverage.get('ratio', 0):.0%} "
+                f"重复长文本:{evidence['duplicate_comments']}/{len(samples)} "
+                f"涉及账号:{evidence['duplicate_users']} 时间跨度上界:{evidence['burst_span_seconds']}秒 "
+                f"信号:{','.join(evidence['flags'])} textHash:{evidence['text_hash']} "
+                "仅作诊断，未确认水军"
+            )
+
     def _throttle_external_request(self):
         time.sleep(random.uniform(*CONFIG['external_request_delay']))
 
@@ -3047,12 +3245,7 @@ class SmzdmScraper:
             )
 
     def _check_shill(self, parsed):
-        """第四阶段：互动数据水军检测兜底
-
-        水军贴典型特征：
-        1. 值票极高但几乎无不值票（正常商品会有一定反对声音）
-        2. 值票多但评论极少（真实用户投票的同时通常也会评论）
-        """
+        """保留增长停滞过滤，投票/评论比例只记录异常，不推断账号真伪。"""
         if self._is_growth_stalled(parsed):
             self.stats['total_filtered_trend_stale'] += 1
             trend = parsed.get('trend_metrics') or {}
@@ -3092,11 +3285,12 @@ class SmzdmScraper:
                 reasons.append(f"评论/值票比过低: {comments}/{worthy}={comment_ratio:.2f}")
 
         if len(reasons) >= CONFIG['shill_min_flags']:
-            logging.warning(
-                f"[水军嫌疑] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
-                + " | ".join(reasons)
+            self.stats['total_engagement_anomaly_observed'] = self.stats.get('total_engagement_anomaly_observed', 0) + 1
+            parsed['engagement_anomaly_flags'] = reasons
+            logging.info(
+                f"[互动比例异常观察] {parsed['title'][:40]}... | {self._candidate_log_context(parsed)} "
+                + " | ".join(reasons) + " | 仅作诊断，未确认水军"
             )
-            return False
 
         return True
 
@@ -3119,6 +3313,60 @@ class SmzdmScraper:
         )
 
     # ==================== 推送 ====================
+
+    @staticmethod
+    def _push_recipient_key():
+        """只保存接收人哈希；冷却不跨 UID，也不属于已推送历史。"""
+        if not isinstance(UID, str) or not UID or re.search(r'[\s\x00-\x1f\x7f,;]', UID):
+            return ''
+        return hashlib.sha256(UID.encode('utf-8')).hexdigest()
+
+    def _is_push_keyword_cooling_down(self, article_id):
+        recipient_key = self._push_recipient_key()
+        article_id = str(article_id or '').strip()
+        if not recipient_key or not article_id:
+            return False
+        return self.conn.execute(
+            '''SELECT 1 FROM push_keyword_cooldowns
+               WHERE recipient_key = ? AND article_id = ? AND expires_at > ?''',
+            (recipient_key, article_id, datetime.utcnow().isoformat(timespec='seconds')),
+        ).fetchone() is not None
+
+    def _skip_push_keyword_cooldown(self, data):
+        if not self._is_push_keyword_cooling_down(data.get('id')):
+            return False
+        self.stats['total_push_keyword_cooldown_skipped'] += 1
+        logging.info(
+            f"[关键词冷却跳过] {self._candidate_log_context(data)} "
+            "接收人明确的关键词过滤尚在冷却期，未写入推送历史"
+        )
+        return True
+
+    def _save_push_keyword_cooldown(self, article_id):
+        minutes = max(0, int(CONFIG.get('push_keyword_cooldown_minutes', 45)))
+        recipient_key = self._push_recipient_key()
+        article_id = str(article_id or '').strip()
+        if not minutes or not recipient_key or not article_id:
+            return
+        expires_at = datetime.utcnow() + timedelta(minutes=minutes)
+        self.conn.execute(
+            '''INSERT INTO push_keyword_cooldowns (recipient_key, article_id, expires_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(recipient_key, article_id) DO UPDATE SET
+                   expires_at = excluded.expires_at''',
+            (recipient_key, article_id, expires_at.isoformat(timespec='seconds')),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _is_target_keyword_rejection(target):
+        # 只认已在真实返回中出现的明确拒绝措辞，不能把任意失败或“关键字”提示当作用户过滤。
+        status = target.get('status')
+        return (
+            target.get('code') == 1001
+            and isinstance(status, str)
+            and '因为用户设置的关键字过滤，不发送' in status
+        )
 
     def _send_notification(self, data):
         """确认目标接收人的发送任务已创建；不代表异步消息已经到达。"""
@@ -3143,6 +3391,8 @@ class SmzdmScraper:
 
         if not isinstance(UID, str) or not UID or re.search(r'[\s\x00-\x1f\x7f,;]', UID):
             return failed('接收人配置为空或不是单个有效 UID')
+        if self._skip_push_keyword_cooldown(data):
+            return False
 
         try:
             content = self._build_notification_content(data)
@@ -3189,6 +3439,14 @@ class SmzdmScraper:
                 f"sendRecordId:{record_id or '-'}"
             )
             if target.get('code') != 1000:
+                if self._is_target_keyword_rejection(target):
+                    self.stats['total_push_keyword_filtered'] += 1
+                    self._save_push_keyword_cooldown(data.get('id'))
+                    logging.info(
+                        f"[关键词过滤冷却] {self._candidate_log_context(data)} "
+                        f"冷却:{CONFIG['push_keyword_cooldown_minutes']}分钟 | {delivery_note}"
+                    )
+                    return False
                 return failed(delivery_note)
 
             data['push_send_record_id'] = record_id
@@ -3409,6 +3667,14 @@ class SmzdmScraper:
         if level_note:
             level_note = level_note.replace('评论等级未确认:sample', '评论等级样本不足')
             diagnostics.append(level_note)
+        anomaly = data.get('comment_anomaly_stats') or {}
+        if anomaly.get('flags'):
+            note = '评论样本有重复长文本'
+            if 'duplicate_text_burst' in anomaly['flags']:
+                note += '及时间集中'
+            diagnostics.append(note + '，仅作参考，未确认水军')
+        if data.get('engagement_anomaly_flags'):
+            diagnostics.append('投票与评论比例异常，仅作参考，未确认水军')
         trend = data.get('trend_metrics') or {}
         if trend.get('snapshot_count', 0):
             diagnostics.append(
@@ -3637,6 +3903,11 @@ class SmzdmScraper:
             (snapshot_cutoff.isoformat(timespec='seconds'),)
         )
         recheck_deleted = recheck_cursor.rowcount
+        cooldown_cursor = self.conn.execute(
+            'DELETE FROM push_keyword_cooldowns WHERE expires_at <= ?',
+            (datetime.utcnow().isoformat(timespec='seconds'),),
+        )
+        cooldown_deleted = cooldown_cursor.rowcount
 
         self.conn.commit()
         if deleted > 0:
@@ -3647,6 +3918,8 @@ class SmzdmScraper:
             logging.info(f"清理 {snapshot_deleted} 条过期候选快照")
         if recheck_deleted > 0:
             logging.info(f"清理 {recheck_deleted} 条过期延迟复查状态")
+        if cooldown_deleted > 0:
+            logging.info(f"清理 {cooldown_deleted} 条到期关键词冷却状态")
 
     # ==================== 辅助 ====================
 
@@ -3691,7 +3964,7 @@ class SmzdmScraper:
             logging.info(f"  京东自营校验: {self.jd_self_checks}/{self.jd_self_check_limit}")
         else:
             logging.info("  京东自营校验: 关闭")
-        logging.info(f"  评论等级水军过滤: {self.stats['total_filtered_comment_level']}")
+        logging.info(f"  评论等级/集中度过滤: {self.stats['total_filtered_comment_level']}")
         logging.info(f"  评论等级不可用: {self.stats['total_comment_level_unavailable']}")
         logging.info(f"    预算不足: {self.stats['total_comment_level_unavailable_budget']}")
         logging.info(f"    样本不足: {self.stats['total_comment_level_unavailable_sample']}")
@@ -3701,8 +3974,12 @@ class SmzdmScraper:
         logging.info(f"  评论等级兜底放行: {self.stats['total_comment_level_fallback_allowed']}")
         logging.info(f"  评论大区少样本放行: {self.stats['total_comment_level_large_thread_allowed']}")
         logging.info(f"  评论模块覆盖不足跳过: {self.stats['total_comment_level_undercovered_skipped']}")
+        logging.info(f"  评论等级证据不足仅诊断: {self.stats['total_comment_level_insufficient_evidence']}")
+        logging.info(f"  评论长文本重复观察: {self.stats['total_comment_anomaly_observed']}")
+        logging.info(f"    同组时间集中观察: {self.stats['total_comment_anomaly_combined']}")
+        logging.info(f"  互动比例异常仅诊断: {self.stats['total_engagement_anomaly_observed']}")
         logging.info(f"  评论预算不足强信号放行: {self.stats['total_comment_level_budget_strong_allowed']}")
-        logging.info(f"  互动数据水军过滤: {self.stats['total_filtered_shill']}")
+        logging.info(f"  互动检查拒绝（增长停滞）: {self.stats['total_filtered_shill']}")
         logging.info(f"  增长停滞过滤: {self.stats['total_filtered_trend_stale']}")
         logging.info(f"  增长过低过滤: {self.stats['total_filtered_trend_low_growth']}")
         logging.info(f"  增长过慢过滤: {self.stats['total_filtered_trend_slow']}")
@@ -3710,6 +3987,8 @@ class SmzdmScraper:
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info(f"  推送失败: {self.stats['total_push_failed']}")
         logging.info(f"    POST 超时结果未知: {self.stats['total_push_unknown']}")
+        logging.info(f"  接收人关键词明确过滤: {self.stats['total_push_keyword_filtered']}")
+        logging.info(f"  关键词冷却候选跳过: {self.stats['total_push_keyword_cooldown_skipped']}")
         if self.quality_path_sent_counts:
             sent_summary = ", ".join(
                 f"{path}:{count}"

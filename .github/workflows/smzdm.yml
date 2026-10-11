@@ -47,11 +47,18 @@ jobs:
         if: ${{ inputs.debug_article_id != '' }}
         env:
           DEBUG_ARTICLE_ID: ${{ inputs.debug_article_id }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: |
           if [[ ! "$DEBUG_ARTICLE_ID" =~ ^[0-9]+$ ]]; then
             echo "debug_article_id must contain digits only"
             exit 1
           fi
+          # 诊断在 scraper 之前执行，先兼容旧缓存的表结构，包含关键词冷却表。
+          python - <<'PY'
+          from smzdm import SmzdmScraper
+          scraper = SmzdmScraper()
+          scraper._cleanup()
+          PY
           echo "Candidate snapshots for article $DEBUG_ARTICLE_ID:"
           sqlite3 -header -column smzdm.db "
             SELECT article_id, item_key, title, worthy, collection,
@@ -94,11 +101,9 @@ jobs:
             echo "Next eligible late-recheck rows:"
             python - <<'PY'
           import os
-          import sqlite3
           from smzdm import SmzdmScraper
 
-          scraper = SmzdmScraper.__new__(SmzdmScraper)
-          scraper.conn = sqlite3.connect("smzdm.db")
+          scraper = SmzdmScraper()
           rows = scraper._select_late_recheck_rows(set(), 100000)
           target = os.environ["DEBUG_ARTICLE_ID"]
           target_position = next(
@@ -114,6 +119,7 @@ jobs:
                   f"worthy={row['worthy']} captured={row['captured_at']} "
                   f"title={row['title']}"
               )
+          scraper._cleanup()
           PY
           fi
 
